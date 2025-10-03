@@ -24,7 +24,7 @@ from typing import Any, Callable, Optional, Sequence, Set, Tuple, Union
 from absl import logging
 from clu import parameter_overview
 import jax
-from jax.experimental import roofline
+#from jax.experimental import roofline
 import jax.numpy as jnp
 from jax.tree_util import tree_map
 import ml_collections
@@ -136,8 +136,8 @@ def compute_flops(
     else:
       dummy_input.append(None)
 
-  _, analysis = roofline.roofline(flax_model_apply_fn)(*dummy_input)
-  flops = analysis.unfused_flops
+  #_, analysis = roofline.roofline(flax_model_apply_fn)(*dummy_input)
+  flops = 0#analysis.unfused_flops
   if fuse_multiply_add:
     flops = flops / 2
   logging.info('GFLOPs %0.3f for input spec: %s', flops / 10**9, input_spec)
@@ -193,17 +193,17 @@ def compute_flops_with_pytree(
 
   dummy_input = create_dummy_input(input_spec)
 
-  if isinstance(dummy_input, dict) and unpack_input:
-    # We can't pass custom kwargs to roofline, so we have to use a lambda.
-    _, analysis = roofline.roofline(
-        lambda: flax_model_apply_fn(**dummy_input)
-    )()
-  elif isinstance(dummy_input, abc.Sequence) and unpack_input:
-    _, analysis = roofline.roofline(flax_model_apply_fn)(*dummy_input)
-  else:
-    _, analysis = roofline.roofline(flax_model_apply_fn)(dummy_input)
+  # if isinstance(dummy_input, dict) and unpack_input:
+  #   # We can't pass custom kwargs to roofline, so we have to use a lambda.
+  #   _, analysis = roofline.roofline(
+  #       lambda: flax_model_apply_fn(**dummy_input)
+  #   )()
+  # elif isinstance(dummy_input, abc.Sequence) and unpack_input:
+  #   _, analysis = roofline.roofline(flax_model_apply_fn)(*dummy_input)
+  # else:
+  #   _, analysis = roofline.roofline(flax_model_apply_fn)(dummy_input)
 
-  flops = analysis.unfused_flops
+  flops = 0#analysis.unfused_flops
   if fuse_multiply_add:
     flops = flops / 2
   logging.info('GFLOPs %0.3f for input spec: %s', flops / 10**9, input_spec)

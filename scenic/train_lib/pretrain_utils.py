@@ -20,7 +20,7 @@ import re
 from typing import Any, Dict, Mapping, List, Optional, Union
 
 from absl import logging
-from big_vision import utils
+#from big_vision import utils
 import flax
 from flax.training import checkpoints
 import numpy as np
@@ -318,7 +318,8 @@ def convert_big_vision_to_scenic_checkpoint(
 
   logging.info('Loading big_vision checkpoint from %s', checkpoint_path)
   if '.bv' in checkpoint_path:
-    checkpoint_data = utils.load_checkpoint_ts(checkpoint_path)
+    None
+    #checkpoint_data = utils.load_checkpoint_ts(checkpoint_path)
   else:
     checkpoint_data = np.load(gfile.GFile(checkpoint_path, 'rb'))
   tree = unflatten_dict(checkpoint_data, separator='/', leaf_idx=0)

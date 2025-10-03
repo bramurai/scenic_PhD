@@ -69,17 +69,19 @@ install_requires_projects = [
 ]
 
 install_requires_core = [
-    "absl-py>=1.0.0",
-    "numpy>=1.12",
-    "jax>=0.4.3",
-    "jaxlib>=0.4.3",
-    "flax>=0.4.0",
+    "absl-py>=1.0.0,<2.0.0",
+    "numpy>=1.12,<2",
+    "scipy>=1.8.0,<1.9.0",
+    "jax>=0.4.3,<0.4.24",
+    "jaxlib>=0.4.3,<0.4.24",
+    "flax>=0.4.0,<0.7.0",
     "ml-collections>=0.1.1",
-    "tensorflow>=2.7",
+    "tensorflow>=2.7,<2.12",
+    "tensorflow-addons>=0.19.0",
     "immutabledict>=2.2.1",
-    "clu>=0.0.6",
-    "tensorflow-datasets",
-    "optax @ git+https://github.com/google-deepmind/optax.git@main",
+    "clu>=0.0.6,<0.0.13",
+    "tensorflow-datasets>=4.0.0,<4.9.0",
+    "optax==0.1.5",
 ]
 
 tests_require = [
