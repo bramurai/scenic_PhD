@@ -44,6 +44,7 @@ def get_config():
   }
   config.dataset_configs.num_classes = 527
   config.data_dtype_str = 'float32'
+  
   # List of modalities to load, supports `rgb` and `spectrogram'.
   # Note that this only specifies which modalities to load, not which to use,
   # which is controlled by config.model.modality_fusion
@@ -110,6 +111,7 @@ def get_config():
   config.model.test_with_bottlenecks = True
   config.model.share_encoder = False
   config.model.n_bottlenecks = 4
+  
   # Layer at which to fuse. '0' refers to early fusion, if fusion_layer is equal
   # to model.num_layers, then there is no cross-modal attention in the transformer
   # and CLS tokens for each modality are averaged right at the end.
@@ -157,6 +159,7 @@ def get_config():
   # Use ImageNet-21k-initialised model from big_vision checkpoint
   config.init_from = ml_collections.ConfigDict()
   config.init_from.model_config = None
+ 
   # Download pretrained ImageNet checkpoints from here:
   # https://github.com/google-research/scenic/tree/main/scenic/projects/baselines (checkpoint_format = 'scenic')  pylint: disable=line-too-long
   # https://github.com/google-research/vision_transformer (checkpoint_format = 'big_vision')  pylint: disable=line-too-long
