@@ -1,4 +1,4 @@
-# Copyright 2025 The Scenic Authors.
+# Copyright 2023 The Scenic Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,51 +12,194 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Training Script for ViViT."""
+"""Training Script."""
 
-import copy
 import functools
-from typing import Any, Dict, Tuple
+from typing import Any, Callable, Dict, Tuple, Optional, Type
 
 from absl import logging
 from clu import metric_writers
 from clu import periodic_actions
-import flax
 from flax import jax_utils
+import flax.linen as nn
 import jax
+from jax.example_libraries.optimizers import clip_grads
 import jax.numpy as jnp
 import jax.profiler
 import ml_collections
 import numpy as np
 from scenic.dataset_lib import dataset_utils
-from scenic.projects.vivit import evaluation_lib
-from scenic.projects.vivit import train_utils as vivit_train_utils
+from scenic.model_lib.base_models import base_model
+from scenic.train_lib_deprecated import lr_schedules
+from scenic.train_lib_deprecated import optimizers
+from scenic.train_lib_deprecated import train_utils
 
-# from scenic.train_lib_deprecated import lr_schedules
-# from scenic.train_lib_deprecated import optimizers
-# from scenic.train_lib_deprecated import pretrain_utils
-# from scenic.train_lib_deprecated import train_utils
 
-from scenic.train_lib import lr_schedules
-from scenic.train_lib import optimizers
-from scenic.train_lib import pretrain_utils
-from scenic.train_lib import train_utils
+# Aliases for custom types:
+Batch = Dict[str, jnp.ndarray]
+MetricFn = Callable[[jnp.ndarray, Dict[str, jnp.ndarray]],
+                    Dict[str, Tuple[float, int]]]
+LossFn = Callable[[jnp.ndarray, Batch, Optional[jnp.ndarray]], float]
+
+
+def train_step(
+    train_state: train_utils.TrainState,
+    batch: Batch,
+    *,
+    flax_model: nn.Module,
+    learning_rate_fn: Callable[[int], float],
+    loss_fn: LossFn,
+    metrics_fn: MetricFn,
+    config: ml_collections.ConfigDict,
+    debug: Optional[bool] = False
+) -> Tuple[train_utils.TrainState, Dict[str, Tuple[float, int]], float]:
+  """Runs a single step of training.
+  Given the state of the training and a batch of data, computes
+  the loss and updates the parameters of the model.
+  Note that in this code, the buffers of the first (train_state) and second
+  (batch) arguments are donated to the computation.
+  Args:
+    train_state: The state of training including the current
+      global_step, model_state, rng, and optimizer. The buffer of this argument
+      can be donated to the computation.
+    batch: A single batch of data. The buffer of this argument can be donated to
+      the computation.
+    flax_model: A Flax model.
+    learning_rate_fn: learning rate scheduler which give the global_step
+      generates the learning rate.
+    loss_fn: A loss function that given logits, a batch, and parameters of the
+      model calculates the loss.
+    metrics_fn: A metrics function that given logits and batch of data,
+      calculates the metrics as well as the loss.
+    config: Configurations of the experiment.
+    debug: Whether the debug mode is enabled during training. `debug=True`
+      enables model specific logging/storing some values using
+      jax.host_callback.
+  Returns:
+    Updated state of training, computed metrics, and learning rate for logging.
+  """
+  new_rng, rng = jax.random.split(train_state.rng)
+
+  if config.get('mixup') and config.mixup.alpha:
+    mixup_rng, rng = jax.random.split(rng, 2)
+    mixup_rng = train_utils.bind_rng_to_host_device(
+        mixup_rng,
+        axis_name='batch',
+        bind_to=config.mixup.get('bind_to', 'device'))
+    batch = dataset_utils.mixup(
+        batch,
+        config.mixup.alpha,
+        config.mixup.get('image_format', 'NHWC'),
+        rng=mixup_rng)
+
+  # Bind the rng to the host/device we are on.
+  dropout_rng = train_utils.bind_rng_to_host_device(
+      rng, axis_name='batch', bind_to='device')
+
+  def training_loss_fn(params):
+    variables = {'params': params, **train_state.model_state}
+    logits, new_model_state = flax_model.apply(
+        variables,
+        batch['inputs'],
+        mutable=['batch_stats'],
+        train=True,
+        rngs={'dropout': dropout_rng},
+        debug=debug)
+    loss = loss_fn(logits, batch, variables['params'])
+    return loss, (new_model_state, logits)
+
+  compute_gradient_fn = jax.value_and_grad(training_loss_fn, has_aux=True)
+  step = train_state.global_step
+  lr = learning_rate_fn(step)
+  (train_cost,
+   (new_model_state,
+    logits)), grad = compute_gradient_fn(train_state.optimizer.target)
+
+  del train_cost
+  # Re-use same axis_name as in the call to `pmap(...train_step...)` below.
+  grad = jax.lax.pmean(grad, axis_name='batch')
+
+  if config.get('max_grad_norm', None) is not None:
+    grad = clip_grads(grad, config.max_grad_norm)
+
+  new_optimizer = train_state.optimizer.apply_gradient(grad, learning_rate=lr)
+
+  # Explicit weight decay, if necessary.
+  if config.get('explicit_weight_decay', None) is not None:
+    new_optimizer = new_optimizer.replace(
+        target=optimizers.tree_map_with_names(
+            functools.partial(
+                optimizers.decay_weight_fn,
+                lr=lr,
+                decay=config.explicit_weight_decay),
+            new_optimizer.target,
+            match_name_fn=lambda name: 'kernel' in name))
+
+  metrics = metrics_fn(logits, batch)
+  new_train_state = train_state.replace(  # pytype: disable=attribute-error
+      global_step=step + 1,
+      optimizer=new_optimizer,
+      model_state=new_model_state,
+      rng=new_rng)
+  return new_train_state, metrics, lr
+
+
+def eval_step(
+    train_state: train_utils.TrainState,
+    batch: Batch,
+    *,
+    flax_model: nn.Module,
+    metrics_fn: MetricFn,
+    debug: Optional[bool] = False
+) -> Tuple[Dict[str, Tuple[float, int]], jnp.ndarray]:
+  """Runs a single step of training.
+  Note that in this code, the buffer of the second argument (batch) is donated
+  to the computation.
+  Assumed API of metrics_fn is:
+  ```metrics = metrics_fn(logits, batch)
+  where batch is yielded by the batch iterator, and metrics is a dictionary
+  mapping metric name to a vector of per example measurements. eval_step will
+  aggregate (by summing) all per example measurements and divide by the
+  aggregated normalizers. For each given metric we compute:
+  1/N sum_{b in batch_iter} metric(b), where  N is the sum of normalizer
+  over all batches.
+  Args:
+    train_state: TrainState, the state of training including the current
+      global_step, model_state, rng, and optimizer. The buffer of this argument
+      can be donated to the computation.
+    batch: A single batch of data. a metrics function, that given logits and
+      batch of data, calculates the metrics as well as the loss.
+    flax_model: A Flax model.
+    metrics_fn: A metrics function, that given logits and batch of data,
+      calculates the metrics as well as the loss.
+    debug: Whether the debug mode is enabled during evaluation.
+      `debug=True` enables model specific logging/storing some values using
+      jax.host_callback.
+  Returns:
+    Calculated metrics and logits.
+  """
+  variables = {
+      'params': train_state.optimizer.target,
+      **train_state.model_state
+  }
+  logits = flax_model.apply(
+      variables, batch['inputs'], train=False, mutable=False, debug=debug)
+  metrics = metrics_fn(logits, batch)
+  return metrics, logits
 
 
 def train(
     *,
     rng: jnp.ndarray,
     config: ml_collections.ConfigDict,
-    model_cls: Any,
+    model_cls: Type[base_model.BaseModel],
     dataset: dataset_utils.Dataset,
     workdir: str,
     writer: metric_writers.MetricWriter,
 ) -> Tuple[train_utils.TrainState, Dict[str, Any], Dict[str, Any]]:
   """Main training loop lives in this function.
-
   Given the model class and dataset, it prepares the items needed to run the
   training, including the TrainState.
-
   Args:
     rng: Jax rng key.
     config: Configurations of the experiment.
@@ -66,20 +209,15 @@ def train(
       optionally, test_iter.
     workdir: Directory for checkpointing.
     writer: CLU metrics writer instance.
-
   Returns:
     train_state that has the state of training (including current
       global_step, model_state, rng, and the optimizer), train_summary
       and eval_summary which are dict of metrics. These outputs are used for
       regression testing.
   """
-  flax.config.update('flax_return_frozendict', True)
   lead_host = jax.process_index() == 0
   # Build the loss_fn, metrics, and flax_model.
   model = model_cls(config, dataset.meta_data)
-  is_multilabel_model = (config.model_name == 'vivit_multilabel_classification')
-  get_confusion_matrix = (config.get('confusion_matrix_metrics', False)
-                          and not is_multilabel_model)
 
   # Initialize model.
   rng, init_rng = jax.random.split(rng)
@@ -108,39 +246,10 @@ def train(
   if config.checkpoint:
     train_state, start_step = train_utils.restore_checkpoint(
         workdir, train_state)
-
-  if (start_step == 0  # Which means "no" checkpoint is restored!
-      and config.get('init_from') is not None):
-    restored_model_cfg = config.init_from.get('model_config')
-    init_checkpoint_path = config.init_from.get('checkpoint_path')
-    checkpoint_format = config.init_from.get('checkpoint_format', 'scenic')
-    if checkpoint_format == 'scenic':
-      restored_train_state = pretrain_utils.restore_pretrained_checkpoint(
-          init_checkpoint_path, train_state, assert_exist=True)
-    elif checkpoint_format == 'big_vision':
-      restored_train_state = (
-          pretrain_utils.convert_big_vision_to_scenic_checkpoint(
-              init_checkpoint_path, train_state))
-      # Config dict in big_vision is not the same format as scenic.
-      # Therefore, make sure config match the config of the loaded model!
-      restored_model_cfg = copy.deepcopy(config)
-      # The following is needed when the restored and target models used a
-      # different classifier. As big_vision uses a different config dict, we
-      # have to specify this manually.
-      restored_model_cfg.model.classifier = config.init_from.get(
-          'classifier_type', 'token')
-
-    train_state = model.init_from_train_state(train_state, restored_train_state,
-                                              restored_model_cfg)
-    # Free unnecessary memory.
-    del restored_train_state
-  elif start_step == 0:
-    logging.info('Training completely from scratch.'
-                 'Not restoring from any checkpoint.')
-
   # Replicate the optimzier, state, and rng.
   train_state = jax_utils.replicate(train_state)
   del params  # Do not keep a copy of the initial params.
+
   # Calculate the total number of training steps.
   total_steps, steps_per_epoch = train_utils.get_num_training_steps(
       config, dataset.meta_data)
@@ -149,7 +258,7 @@ def train(
 
   train_step_pmapped = jax.pmap(
       functools.partial(
-          vivit_train_utils.train_step,
+          train_step,
           flax_model=model.flax_model,
           learning_rate_fn=learning_rate_fn,
           loss_fn=model.loss_function,
@@ -162,46 +271,15 @@ def train(
   )
   eval_step_pmapped = jax.pmap(
       functools.partial(
-          vivit_train_utils.eval_step,
+          eval_step,
           flax_model=model.flax_model,
           metrics_fn=model.get_metrics_fn('validation'),
-          return_logits_and_labels=is_multilabel_model,
-          return_confusion_matrix=get_confusion_matrix,
           debug=config.debug_eval),
       axis_name='batch',
       # We can donate the eval_batch's buffer.
       donate_argnums=(1,),
   )
   log_eval_steps = config.get('log_eval_steps') or steps_per_epoch
-  log_test_steps = 0
-  if config.dataset_configs.get('do_multicrop_test'):
-    log_test_steps = int(steps_per_epoch *
-                         config.dataset_configs.log_test_epochs)
-
-    test_step_pmapped = jax.pmap(
-        functools.partial(
-            vivit_train_utils.test_step,
-            flax_model=model.flax_model,
-            metrics_fn=model.get_metrics_fn('test'),
-            n_clips=config.get('multicrop_clips_per_device', 2),
-            debug=config.debug_eval),
-        axis_name='batch',
-        # We can donate the test_batch's buffer.
-        donate_argnums=(1,),
-    )
-
-    assert config.dataset_configs.test_batch_size == jax.local_device_count(), (
-        'The per-host batch size must be equal to the number of local devices.'
-        'This ensures that each TPU device is processing different views of'
-        'the same original video.')
-
-    total_test_steps = int(
-        np.ceil(dataset.meta_data['num_test_examples'] /
-                (config.get('dataset_configs.test_batch_size') *
-                 config.get('dataset_configs.num_test_clips') *
-                 jax.process_count())))
-    steps_per_test = config.get('steps_per_test') or total_test_steps
-
   if not log_eval_steps:
     raise ValueError("'log_eval_steps' should be specified in the config.")
   checkpoint_steps = config.get('checkpoint_steps') or log_eval_steps
@@ -252,91 +330,42 @@ def train(
       train_metrics.append(t_metrics)
       # Additional training logs: learning rate:
       extra_training_logs.append({'learning_rate': lr})
-
     for h in hooks:
-      # Catch exception in case XProf fails.
-      try:
-        h(step)
-      except ValueError as error:
-        logging.exception('Hook failed: %r', error)
-
+      h(step)
     chrono.pause()  # Below are once-in-a-while ops -> pause.
     ###################### LOG TRAIN SUMMARY ########################
     if (step % log_summary_steps == 1) or (step == total_steps):
       if lead_host:
         chrono.tick(step, writer=writer)
+      # train_metrics is list of a dictionaries of metrics, where the shape of
+      # the metrics[key] is [n_local_devices]. However, because metric functions
+      # have a psum, we have already summed across the whole sharded batch, and
+      # what's returned is n_local_devices copies of the same summed metric.
+      # So we do unreplicate and fetch them to host using `unreplicate_and_get`.
       train_summary = train_utils.log_train_summary(
           step=step,
           train_metrics=jax.tree_util.tree_map(train_utils.unreplicate_and_get,
                                                train_metrics),
           extra_training_logs=jax.tree_util.tree_map(
               train_utils.unreplicate_and_get, extra_training_logs),
-          writer=writer,
-          key_separator='/')
+          writer=writer)
       # Reset metric accumulation for next evaluation cycle.
       train_metrics, extra_training_logs = [], []
-
-    ################### EVALUATION ################################
+    ################### EVALUATION #######################
     if (step % log_eval_steps == 1) or (step == total_steps):
       with report_progress.timed('eval'):
         eval_metrics = []
-        additional_summary = None
-        if is_multilabel_model:
-          eval_logits = []
-          eval_labels = []
-          n_classes = dataset.meta_data['num_classes']
-        if get_confusion_matrix:
-          confusion_matrices = []
-          n_classes = dataset.meta_data['num_classes']
-
         # Sync model state across replicas.
         train_state = train_utils.sync_model_state_across_replicas(train_state)
         for _ in range(steps_per_eval):
           eval_batch = next(dataset.valid_iter)
-          e_metrics = eval_step_pmapped(train_state, eval_batch)
-          if is_multilabel_model:
-            e_metrics, logits_batch, labels_batch = e_metrics
-            # TODO(dehghani, lucic): Fetching from the device in each step might
-            #  be an unnecessary penalty. Consider updating to async fetching
-            #  as in CL/378384754.
-            eval_logits.append(vivit_train_utils.to_cpu(logits_batch))
-            eval_labels.append(vivit_train_utils.to_cpu(labels_batch))
-          if get_confusion_matrix:
-            e_metrics, conf_matrix = e_metrics
-            confusion_matrices.append(vivit_train_utils.to_cpu(conf_matrix))
-          # Fetch e_metrics to host and store.
+          e_metrics, _ = eval_step_pmapped(train_state, eval_batch)
           eval_metrics.append(train_utils.unreplicate_and_get(e_metrics))
-
-        # Compute global metrics if applicable from all the batches.
-        if is_multilabel_model:
-          additional_summary = evaluation_lib.compute_mean_average_precision(
-              np.concatenate(eval_logits, axis=0),
-              np.concatenate(eval_labels, axis=0),
-              return_per_class_ap=n_classes < 10)
-        if get_confusion_matrix:
-          additional_summary = evaluation_lib.compute_confusion_matrix_metrics(
-              confusion_matrices, return_per_class_metrics=n_classes < 10)
-          if lead_host:
-            conf_matrix_image = vivit_train_utils.render_confusion_matrices(
-                confusion_matrices, normalization_method='rows')
-            conf_matrix_unnorm = vivit_train_utils.render_confusion_matrices(
-                confusion_matrices, normalization_method='none')
-
-            writer.write_images(
-                step, {'valid/conf_matrix': conf_matrix_image,
-                       'valid/conf_matrix_unnormalized': conf_matrix_unnorm})
-
-        # Log eval summary.
         eval_summary = train_utils.log_eval_summary(
-            step=step,
-            eval_metrics=eval_metrics,
-            extra_eval_summary=additional_summary,
-            writer=writer,
-            key_separator='/')
-        writer.flush()
-        del eval_metrics
-
-    ##################### CHECKPOINTING ###########################
+            step=step, eval_metrics=eval_metrics, writer=writer)
+      writer.flush()
+      del eval_metrics
+    ##################### CHECKPOINTING ###################
     if ((step % checkpoint_steps == 0 and step > 0) or
         (step == total_steps)) and config.checkpoint:
       with report_progress.timed('checkpoint'):
@@ -346,39 +375,8 @@ def train(
           train_state.replace(  # pytype: disable=attribute-error
               accum_train_time=chrono.accum_train_time)
           train_utils.save_checkpoint(workdir, train_state)
-
-    ############# MULTICROP TESTING ############################
-    if (config.dataset_configs.get('do_multicrop_test') and
-        ((step % log_test_steps == 1 and step > 1) or step == total_steps)):
-      with report_progress.timed('test'):
-        test_metrics = []
-        # Sync model state across replicas.
-        train_state = train_utils.sync_model_state_across_replicas(train_state)
-
-        # At the end of training, evaluate on the whole test set.
-        if step == total_steps:
-          steps_per_test = total_test_steps
-
-        logging.info('Starting multicrop test')
-        for _ in range(steps_per_test):
-          test_batch = next(dataset.test_iter)
-          t_metrics = test_step_pmapped(train_state, test_batch)
-          # Fetch t_metrics to host and store.
-          test_metrics.append(train_utils.unreplicate_and_get(t_metrics))
-        # Log eval summary.
-        train_utils.log_eval_summary(
-            step=step,
-            eval_metrics=test_metrics,
-            writer=writer,
-            prefix='test',
-            key_separator='/')
-        logging.info('Completed multicrop test')
-        writer.flush()
-        # Free up some space.
-        del test_metrics
-
     chrono.resume()  # un-pause now
   # Wait until computations are done before exiting.
-  train_utils.barrier_across_hosts()
-  # Return the train and eval summary after last step for regression testing.
+  jax.random.normal(jax.random.PRNGKey(0), ()).block_until_ready()
+  # Return the train and eval summary after last step for regresesion testing.
   return train_state, train_summary, eval_summary

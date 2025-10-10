@@ -29,9 +29,11 @@ def get_config():
   """Returns the base experiment configuration."""
   config = ml_collections.ConfigDict()
   config.experiment_name = 'mbt_balanced_audioset_classification'
+  config.dataset_name = 'generated_dataset' #added dataset_name
 
   # Dataset.
-  config.dataset_configs.base_dir = '/path/to/dataset'
+  config.dataset_configs = ml_collections.ConfigDict() # added ml_collections.ConfigDict()
+  config.dataset_configs.base_dir = 'generated_dataset'  # '/path/to/dataset'
   config.dataset_configs.tables = {
       'train': 'balanced_train.se.melspec.tfrecord.sst@1024',
       'validation': 'eval.se.melspec.tfrecord.sst@1024',
