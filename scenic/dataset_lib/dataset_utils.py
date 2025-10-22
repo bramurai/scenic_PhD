@@ -35,7 +35,7 @@ import tensorflow_datasets as tfds
 PyTree = Any
 DatasetIterator = Union[Iterator[Any], Dict[str, Iterator[Any]]]
 DatasetIteratorProvider = Callable[[], DatasetIterator]
-DatasetIteratorType = DatasetIterator | DatasetIteratorProvider
+DatasetIteratorType = Union[DatasetIterator, DatasetIteratorProvider]
 DatasetType = Union[tf.data.Dataset, Dict[str, tf.data.Dataset]]
 
 
@@ -70,23 +70,23 @@ class Dataset:
   classification tasks, `num_classes` is used for the configuring head of
   the model.
   """
-  train_iter: DatasetIteratorType | None = None
-  valid_iter: DatasetIteratorType | None = None
-  test_iter: DatasetIteratorType | None = None
+  train_iter: Optional[DatasetIteratorType] = None
+  valid_iter: Optional[DatasetIteratorType] = None
+  test_iter: Optional[DatasetIteratorType] = None
   meta_data: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
-  train_ds: DatasetType | None = None
-  valid_ds: DatasetType | None = None
-  test_ds: DatasetType | None = None
+  train_ds: Optional[DatasetType] = None
+  valid_ds: Optional[DatasetType] = None
+  test_ds: Optional[DatasetType] = None
 
   # Multiple dataset support.
-  train_multi_iter: List[DatasetIteratorType] | None = None
-  valid_multi_iter: List[DatasetIteratorType] | None = None
-  test_multi_iter: List[DatasetIteratorType] | None = None
+  train_multi_iter: Optional[List[DatasetIteratorType]] = None
+  valid_multi_iter: Optional[List[DatasetIteratorType]] = None
+  test_multi_iter: Optional[List[DatasetIteratorType]] = None
 
-  train_multi_ds: List[DatasetType] | None = None
-  valid_multi_ds: List[DatasetType] | None = None
-  test_multi_ds: List[DatasetType] | None = None
+  train_multi_ds: Optional[List[DatasetType]] = None
+  valid_multi_ds: Optional[List[DatasetType]] = None
+  test_multi_ds: Optional[List[DatasetType]] = None
 
 
 def maybe_pad_batch(batch: Dict[str, PyTree],

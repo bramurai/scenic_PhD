@@ -21,7 +21,7 @@ import flax
 import jax.numpy as jnp
 import ml_collections
 import numpy as np
-from scenic.common_lib import debug_utils
+from scenic.common_lib.debug_utils import log_param_shapes #from scenic.common_lib import debug_utils
 from scenic.projects.vivit import model_utils as vivit_utils
 import scipy
 
@@ -114,14 +114,15 @@ def initialise_from_train_state(
     init_config, model_config, dataset_config = config
 
   # Inspect and compare the parameters of the model with the init-model
-  params = flax.core.unfreeze(train_state.optimizer.target)
+  params = flax.core.unfreeze(train_state.params)
   logging.info('Parameters in the target model are: %s', params)
 
   if init_config.get('checkpoint_format', 'scenic') == 'big_vision':
     restored_params = restored_train_state.optimizer['target']
   else:
-    restored_params = restored_train_state.optimizer.target
+    restored_params = restored_train_state.params
   restored_params = flax.core.unfreeze(restored_params)
+
   if init_config.get('init_from_vit', True):
     if prefix_path:
       video_params = params[prefix_path]
@@ -136,18 +137,13 @@ def initialise_from_train_state(
           pass
       elif m_key == 'pre_logits':
         if model_config.representation_size is None:
-          # We don't have representation_size in the new model, so let's ignore
-          #   if from the pretained model, in case it has it.
-          # Note, removing the key from the dictionary is necessary to prevent
-          #   obscure errors from the Flax optimizer.
           video_params.pop(m_key, None)
         else:
           assert restored_model_cfg.model.representation_size
           video_params[m_key] = m_params
-
       elif m_key in ['Transformer']:
         for tm_key, tm_params in m_params.items():
-          if tm_key == 'posembed_input':  # Might need resolution change
+          if tm_key == 'posembed_input':
             init_posemb(
                 video_params[mbt_transformer_key],
                 m_params,
@@ -177,23 +173,19 @@ def initialise_from_train_state(
                 prefix_path=prefix_path)
           elif 'encoderblock' in tm_key:
             logging.info('Loading encoder parameters.')
-            init_encoderblock(video_params[mbt_transformer_key], m_params,
-                              tm_key)
-          else:  # Other parameters of the Transformer encoder
+            init_encoderblock(video_params[mbt_transformer_key], m_params, tm_key)
+          else:
             video_params[mbt_transformer_key][tm_key] = tm_params
       elif m_key == 'embedding':
-        init_embedding(video_params, m_params, init_config, model_config,
-                       'embedding')
-        init_embedding(video_params, m_params, init_config, model_config,
-                       'embedding_spectrogram')
+        init_embedding(video_params, m_params, init_config, model_config, 'embedding')
+        init_embedding(video_params, m_params, init_config, model_config, 'embedding_spectrogram')
       else:
-        if m_key in train_state.optimizer.target:
+        if m_key in train_state.params:
           video_params[m_key] = m_params
-        if '%s_spectrogram' % m_key in train_state.optimizer.target:
+        if '%s_spectrogram' % m_key in train_state.params:
           video_params['%s_spectrogram' % m_key] = m_params
         else:
-          logging.info('Skipping %s. In restored model but not in target',
-                       m_key)
+          logging.info('Skipping %s. In restored model but not in target', m_key)
   else:
     for m_key, m_params in restored_params.items():
       if m_key == 'output_projection':
@@ -203,24 +195,19 @@ def initialise_from_train_state(
           pass
       elif m_key == 'pre_logits':
         if model_config.representation_size is None:
-          # We don't have representation_size in the new model, so let's ignore
-          #   if from the pretained model, in case it has it.
-          # Note, removing the key from the dictionary is necessary to prevent
-          #   obscure errors from the Flax optimizer.
           params.pop(m_key, None)
         else:
           assert restored_model_cfg.model.representation_size
           params[m_key] = m_params
       else:
-        if m_key in train_state.optimizer.target:
+        if m_key in train_state.params:
           params[m_key] = m_params
         else:
-          logging.info('Skipping %s. In restored model but not in target',
-                       m_key)
+          logging.info('Skipping %s. In restored model but not in target', m_key)
 
   if log_initialised_param_shapes:
     logging.info('Parameter summary after initialising from train state')
-    debug_utils.log_param_shapes(params)
+    log_param_shapes(params) #debug_utils.log_param_shapes(params)
   return train_state.replace(
       optimizer=train_state.optimizer.replace(target=flax.core.freeze(params)))
 

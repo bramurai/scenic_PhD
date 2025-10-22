@@ -63,7 +63,8 @@ class InstallCommand(install.install):
 install_requires_projects = [
     "ott-jax>=0.2.0",
     "sklearn",
-    "lingvo==0.12.6",
+    "scikit-learn==1.2.2",
+    "lingvo==0.11.0",
     "seaborn>=0.11.2",
     "dmvr @ git+https://github.com/google-deepmind/dmvr.git",
 ]
@@ -79,7 +80,7 @@ install_requires_core = [
     "tensorflow>=2.7,<2.12",
     "tensorflow-addons>=0.19.0",
     "immutabledict>=2.2.1",
-    "clu>=0.0.6,<0.0.13",
+    "clu>=0.0.6,<=0.0.9",
     "tensorflow-datasets>=4.0.0,<4.9.0",
     "optax==0.1.5",
 ]

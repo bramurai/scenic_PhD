@@ -1,0 +1,9 @@
+*.pyc
+__pycache__/
+Pretrained_Models/
+*.txt
+*.log
+*.json
+*.model
+*.pkl*
+ffmpeg-git-20240629-amd64-static/qt-faststart

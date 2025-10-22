@@ -15,7 +15,7 @@
 r"""Main script for training MBT models."""
 
 from typing import Any, Callable
-
+import pdb
 from absl import flags
 from clu import metric_writers
 import jax
@@ -45,6 +45,7 @@ def get_model_cls(model_name: str) -> Callable[..., Any]:
 def main(rng: jnp.ndarray, config: ml_collections.ConfigDict, workdir: str,
          writer: metric_writers.MetricWriter):
   """Main function for the MBT project."""
+  #pdb.set_trace()  # BREAKPOINT: Debugging entry point
   model_cls = get_model_cls(config.model_name)
   data_rng, rng = jax.random.split(rng)
   dataset = train_utils.get_dataset(
