@@ -450,22 +450,33 @@ class MBT(nn.Module):
     assert self.classifier in ['token', '0', 'gap', 'gmp', 'gsp']
 
     temporal_dims = {}
+    # Initialize variables needed for bottleneck (used regardless of classifier type)
+    c = None
+    bottleneck_dtype = self.dtype
+    
     for modality in self.modality_fusion:
       x[modality], _ = temporal_encode(
           x[modality], modality, self.temporal_encoding_config, self.patches,
           self.hidden_size)
+      
+      # Extract channel dimension from first modality (needed for bottleneck)
+      if c is None:
+        n, _, c = x[modality].shape
+        bottleneck_dtype = x[modality].dtype
+      
+      # Store temporal dimensions for each modality
+      _, temporal_dims[modality], _ = x[modality].shape
+      
       # If we want to add a class token, add it here.
       if self.classifier in ['token']:
         if modality == 'rgb' or len(self.modality_fusion) == 1:
           name = ''
         else:
           name = modality
-        n, temporal_dims[modality], c = x[modality].shape
         cls = self.param('cls'+name, nn.initializers.zeros, (1, 1, c),
                          x[modality].dtype)
         cls = jnp.tile(cls, [n, 1, 1])
         x[modality] = jnp.concatenate([cls, x[modality]], axis=1)
-        bottleneck_dtype = x[modality].dtype
 
     bottleneck = None
     if self.use_bottleneck:

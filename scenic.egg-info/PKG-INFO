@@ -25,7 +25,7 @@ Requires-Dist: ml-collections>=0.1.1
 Requires-Dist: tensorflow<2.12,>=2.7
 Requires-Dist: tensorflow-addons>=0.19.0
 Requires-Dist: immutabledict>=2.2.1
-Requires-Dist: clu<0.0.13,>=0.0.6
+Requires-Dist: clu<=0.0.9,>=0.0.6
 Requires-Dist: tensorflow-datasets<4.9.0,>=4.0.0
 Requires-Dist: optax==0.1.5
 Provides-Extra: testing
@@ -33,6 +33,7 @@ Requires-Dist: pytest; extra == "testing"
 Requires-Dist: shapely; extra == "testing"
 Requires-Dist: ott-jax>=0.2.0; extra == "testing"
 Requires-Dist: sklearn; extra == "testing"
+Requires-Dist: scikit-learn==1.2.2; extra == "testing"
 Requires-Dist: lingvo==0.11.0; extra == "testing"
 Requires-Dist: seaborn>=0.11.2; extra == "testing"
 Requires-Dist: dmvr@ git+https://github.com/google-deepmind/dmvr.git ; extra == "testing"

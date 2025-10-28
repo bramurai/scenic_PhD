@@ -21,7 +21,7 @@ import flax
 import jax.numpy as jnp
 import ml_collections
 import numpy as np
-from scenic.common_lib import debug_utils
+from scenic.common_lib.debug_utils import log_param_shapes #from scenic.common_lib import debug_utils
 from scenic.projects.vivit import model_utils as vivit_utils
 import scipy
 
@@ -207,7 +207,7 @@ def initialise_from_train_state(
 
   if log_initialised_param_shapes:
     logging.info('Parameter summary after initialising from train state')
-    debug_utils.log_param_shapes(params)
+    log_param_shapes(params) #debug_utils.log_param_shapes(params)
   return train_state.replace(
       optimizer=train_state.optimizer.replace(target=flax.core.freeze(params)))
 

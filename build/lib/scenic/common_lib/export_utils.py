@@ -44,8 +44,8 @@ def convert_and_save_model(
     enable_xla: bool = True,
     compile_model: bool = True,
     saved_model_options: Optional[tf.saved_model.SaveOptions] = None,
-    native_serialization: Optional[str | bool] = "default",
-    native_serialization_platforms: Sequence[str] | None = ("cpu", "tpu")):
+    native_serialization: Optional[Union[str, bool]] = "default",
+    native_serialization_platforms: Optional[Sequence[str]] = ("cpu", "tpu")):
   """Converts a JAX function and saves a SavedModel.
 
   We assume that the JAX model consists of a prediction function and trained
