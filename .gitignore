@@ -7,3 +7,5 @@ Pretrained_Models/
 *.model
 *.pkl*
 ffmpeg-git-20240629-amd64-static/qt-faststart
+build/
+scenic.egg-info/
