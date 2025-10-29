@@ -9,15 +9,6 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 
-# Load modules (adjust for your cluster)
-module load anaconda3
-# Note: ffmpeg is installed in the conda environment, no module needed
-
-# Activate environment (ffmpeg is included)
-source activate scenic_preprocessing
-
-# Set OpenMP workaround
-export KMP_DUPLICATE_LIB_OK=TRUE
 
 # Directories
 OUTPUT_DIR="/scratch/$USER/vggsound_test/tfrecords/train"
@@ -28,11 +19,11 @@ mkdir -p logs
 
 echo "Job ${SLURM_ARRAY_TASK_ID} starting at $(date)"
 
-# Test with just 10 shards processing first 1000 videos
+# Test with just 10 shards processing first 10 videos
 python download_and_preprocess_vggsound.py \
   --csv_path=PreProcessing/vggsound_small.csv \
   --output_path=$OUTPUT_DIR \
-  --num_shards=10 \
+  --num_shards=1 \
   --temp_dir=$TEMP_DIR \
   --check_duration=True \
   --save_progress_every=5
