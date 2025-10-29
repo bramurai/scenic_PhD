@@ -10,12 +10,13 @@
 #SBATCH --ntasks=1
 
 
-# Directories
-OUTPUT_DIR="/scratch/$USER/vggsound_test/tfrecords/train"
-TEMP_DIR="/scratch/$USER/vggsound_test/temp_${SLURM_ARRAY_TASK_ID}"
+# Directories (using project directory instead of /scratch)
+PROJECT_DIR="$HOME/scenic_PhD"  # Adjust if your project is elsewhere
+OUTPUT_DIR="$PROJECT_DIR/PreProcessing/tfrecords_test"
+TEMP_DIR="$PROJECT_DIR/PreProcessing/temp_${SLURM_ARRAY_TASK_ID}"
 mkdir -p $OUTPUT_DIR
 mkdir -p $TEMP_DIR
-mkdir -p logs
+mkdir -p $PROJECT_DIR/logs
 
 echo "Job ${SLURM_ARRAY_TASK_ID} starting at $(date)"
 
