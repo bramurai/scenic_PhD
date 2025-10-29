@@ -33,22 +33,24 @@ except ImportError:
     logging.warning("librosa not installed. Install with: pip install librosa")
     librosa = None
 
-FLAGS = flags.FLAGS
-
-flags.DEFINE_string('csv_path', None, 'Path to input CSV file.')
-flags.DEFINE_string('output_path', None, 'Path to output TFRecord files.')
-flags.DEFINE_string('video_root_path', '', 'Root path for video files (optional).')
-flags.DEFINE_integer('num_shards', 10, 'Number of output shards.')
-flags.DEFINE_bool('decode_audio', True, 'Whether to decode and store audio spectrograms.')
-flags.DEFINE_bool('shuffle_csv', False, 'Whether to shuffle input CSV.')
-flags.DEFINE_integer('target_fps', 25, 'Target frames per second for video.')
-flags.DEFINE_integer('audio_sample_rate', 16000, 'Audio sample rate in Hz.')
-flags.DEFINE_integer('n_mels', 128, 'Number of mel frequency bins.')
-flags.DEFINE_float('win_length_ms', 25.0, 'Window length in milliseconds.')
-flags.DEFINE_float('hop_length_ms', 10.0, 'Hop length in milliseconds.')
-
-flags.mark_flag_as_required('csv_path')
-flags.mark_flag_as_required('output_path')
+# Only define FLAGS if this is run as a script, not when imported as a module
+if __name__ == '__main__':
+    FLAGS = flags.FLAGS
+    
+    flags.DEFINE_string('csv_path', None, 'Path to input CSV file.')
+    flags.DEFINE_string('output_path', None, 'Path to output TFRecord files.')
+    flags.DEFINE_string('video_root_path', '', 'Root path for video files (optional).')
+    flags.DEFINE_integer('num_shards', 10, 'Number of output shards.')
+    flags.DEFINE_bool('decode_audio', True, 'Whether to decode and store audio spectrograms.')
+    flags.DEFINE_bool('shuffle_csv', False, 'Whether to shuffle input CSV.')
+    flags.DEFINE_integer('target_fps', 25, 'Target frames per second for video.')
+    flags.DEFINE_integer('audio_sample_rate', 16000, 'Audio sample rate in Hz.')
+    flags.DEFINE_integer('n_mels', 128, 'Number of mel frequency bins.')
+    flags.DEFINE_float('win_length_ms', 25.0, 'Window length in milliseconds.')
+    flags.DEFINE_float('hop_length_ms', 10.0, 'Hop length in milliseconds.')
+    
+    flags.mark_flag_as_required('csv_path')
+    flags.mark_flag_as_required('output_path')
 
 
 def extract_frames_ffmpeg(video_path: str, start_time: float, end_time: float,

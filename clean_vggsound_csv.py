@@ -1,15 +1,14 @@
 """Clean and validate VGGSound CSV for preprocessing.
 
 This script:
-1. Converts VGGSound CSV to the format expected by generate_audiovisual_from_file.py
-2. Optionally validates which YouTube videos still exist
-3. Generates train/test split CSVs
+1. Converts VGGSound CSV to the format expected by download_and_preprocess_vggsound.py
+2. Generates train/test split CSVs
+3. Creates label mapping
 
 Usage:
     python clean_vggsound_csv.py \
         --input_csv=PreProcessing/vggsound.csv \
-        --output_dir=PreProcessing \
-        --validate_videos=False
+        --output_dir=PreProcessing
 """
 
 import os
@@ -24,8 +23,6 @@ FLAGS = flags.FLAGS
 
 flags.DEFINE_string('input_csv', None, 'Path to original VGGSound CSV.')
 flags.DEFINE_string('output_dir', None, 'Directory for output CSVs.')
-flags.DEFINE_string('video_dir', None, 'Directory where videos are stored (optional, for validation).')
-flags.DEFINE_bool('validate_videos', False, 'Check if video files exist.')
 flags.DEFINE_bool('split_by_original', True, 'Keep original train/test splits.')
 
 flags.mark_flag_as_required('input_csv')
@@ -60,14 +57,13 @@ def parse_vggsound_csv(input_path: str) -> pd.DataFrame:
     return df
 
 
-def convert_to_preprocessing_format(df: pd.DataFrame, video_dir: str = None) -> pd.DataFrame:
+def convert_to_preprocessing_format(df: pd.DataFrame) -> pd.DataFrame:
     """Convert to format expected by generate_audiovisual_from_file.py.
     
     Target format: video_path,start,end,label,clip_id
     
     Args:
         df: DataFrame with VGGSound data.
-        video_dir: Optional directory where videos are stored.
         
     Returns:
         DataFrame in preprocessing format.
@@ -78,18 +74,11 @@ def convert_to_preprocessing_format(df: pd.DataFrame, video_dir: str = None) -> 
     df['start'] = df['start_time']
     df['end'] = df['start_time'] + 10
     
-    # Create video path
-    if video_dir:
-        df['video_path'] = df.apply(
-            lambda row: os.path.join(video_dir, f"{row['video_id']}_{row['start_time']:06d}.mp4"),
-            axis=1
-        )
-    else:
-        # Relative path
-        df['video_path'] = df.apply(
-            lambda row: f"{row['video_id']}_{row['start_time']:06d}.mp4",
-            axis=1
-        )
+    # Create video path (relative, will be used as video_id for downloading)
+    df['video_path'] = df.apply(
+        lambda row: f"{row['video_id']}_{row['start_time']:06d}.mp4",
+        axis=1
+    )
     
     # Create clip_id
     df['clip_id'] = df.apply(
@@ -101,38 +90,6 @@ def convert_to_preprocessing_format(df: pd.DataFrame, video_dir: str = None) -> 
     output_df = df[['video_path', 'start', 'end', 'label', 'clip_id', 'split']].copy()
     
     return output_df
-
-
-def validate_videos(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
-    """Check which video files exist.
-    
-    Args:
-        df: DataFrame with video_path column.
-        
-    Returns:
-        Tuple of (filtered_df with only existing videos, list of missing videos).
-    """
-    logging.info("Validating video files...")
-    
-    missing = []
-    exists_mask = []
-    
-    for idx, row in df.iterrows():
-        if os.path.exists(row['video_path']):
-            exists_mask.append(True)
-        else:
-            exists_mask.append(False)
-            missing.append(row['video_path'])
-        
-        if (idx + 1) % 1000 == 0:
-            logging.info(f"Validated {idx + 1}/{len(df)} videos")
-    
-    filtered_df = df[exists_mask].copy()
-    
-    logging.info(f"Found {len(filtered_df)}/{len(df)} videos")
-    logging.info(f"Missing {len(missing)} videos")
-    
-    return filtered_df, missing
 
 
 def save_splits(df: pd.DataFrame, output_dir: str, split_by_original: bool = True):
@@ -175,24 +132,6 @@ def save_splits(df: pd.DataFrame, output_dir: str, split_by_original: bool = Tru
     logging.info(f"Saved combined CSV: {combined_path} ({len(combined_df)} entries)")
 
 
-def save_missing_list(missing: List[str], output_dir: str):
-    """Save list of missing videos.
-    
-    Args:
-        missing: List of missing video paths.
-        output_dir: Output directory.
-    """
-    if not missing:
-        return
-    
-    missing_path = os.path.join(output_dir, 'vggsound_missing.txt')
-    with open(missing_path, 'w') as f:
-        for video in missing:
-            f.write(f"{video}\n")
-    
-    logging.info(f"Saved missing videos list: {missing_path} ({len(missing)} entries)")
-
-
 def create_label_mapping(df: pd.DataFrame, output_dir: str):
     """Create label to index mapping.
     
@@ -218,39 +157,17 @@ def main(argv):
     df = parse_vggsound_csv(FLAGS.input_csv)
     
     # Convert to preprocessing format
-    df = convert_to_preprocessing_format(df, FLAGS.video_dir)
-    
-    # Validate videos if requested
-    missing = []
-    if FLAGS.validate_videos:
-        if not FLAGS.video_dir:
-            logging.warning("video_dir not specified, skipping validation")
-        else:
-            df, missing = validate_videos(df)
+    df = convert_to_preprocessing_format(df)
     
     # Save splits
     save_splits(df, FLAGS.output_dir, FLAGS.split_by_original)
-    
-    # Save missing videos list
-    if missing:
-        save_missing_list(missing, FLAGS.output_dir)
     
     # Save label mapping
     create_label_mapping(df, FLAGS.output_dir)
     
     logging.info("\n=== Summary ===")
     logging.info(f"Total entries: {len(df)}")
-    if FLAGS.validate_videos and FLAGS.video_dir:
-        logging.info(f"Valid videos: {len(df)}")
-        logging.info(f"Missing videos: {len(missing)}")
     logging.info(f"Output directory: {FLAGS.output_dir}")
-    logging.info("\nNext steps:")
-    logging.info("1. Download missing videos (if any) using yt-dlp")
-    logging.info("2. Run preprocessing:")
-    logging.info(f"   python generate_audiovisual_from_file.py \\")
-    logging.info(f"     --csv_path={os.path.join(FLAGS.output_dir, 'vggsound_train.csv')} \\")
-    logging.info(f"     --output_path=/path/to/tfrecords/train \\")
-    logging.info(f"     --decode_audio=True --num_shards=100")
 
 
 if __name__ == '__main__':
