@@ -105,16 +105,17 @@ def download_youtube_video(video_id: str, start_time: int, output_path: str,
                 return False
             # else: duration is sufficient, proceed with download
         
-        # Use yt-dlp's native segment extraction with simpler format to avoid ffmpeg merge issues
-        # Format 94 is usually available and includes both video+audio in one stream
+        # Use yt-dlp's native segment extraction with optimized settings for speed
         cmd = [
             'yt-dlp',
             '--quiet',
             '--no-warnings',
-            '--format', 'best[ext=mp4]/best',  # Single stream avoids ffmpeg merging
+            '--format', 'worst[ext=mp4]/worst',  # Download lowest quality for speed (we resize to 256 anyway!)
             '--download-sections', f'*{start_time}-{start_time+10}',
             '--output', output_path,
             '--no-playlist',
+            '--concurrent-fragments', '4',  # Download fragments in parallel
+            '--throttled-rate', '100K',  # Skip if speed drops below 100KB/s
             url
         ]
         

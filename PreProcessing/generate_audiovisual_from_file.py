@@ -54,7 +54,7 @@ if __name__ == '__main__':
 
 
 def extract_frames_ffmpeg(video_path: str, start_time: float, end_time: float,
-                          target_fps: int = 25) -> List[np.ndarray]:
+                          target_fps: int = 25, min_resize: int = 256) -> List[np.ndarray]:
     """Extract RGB frames from video using ffmpeg.
     
     Args:
@@ -62,29 +62,51 @@ def extract_frames_ffmpeg(video_path: str, start_time: float, end_time: float,
         start_time: Start time in seconds.
         end_time: End time in seconds.
         target_fps: Target frames per second.
+        min_resize: Resize so shortest side equals this (default 256, preserves aspect ratio).
         
     Returns:
         List of RGB frames as numpy arrays.
     """
     try:
-        # Get video info
+        # Extract frames with resizing (shortest side = min_resize, preserving aspect ratio)
+        # ffmpeg scale=-1:256 means: height=256, width=auto (preserve aspect)
+        # ffmpeg scale=256:-1 means: width=256, height=auto (preserve aspect)
+        # We use scale=-2:min_resize for portrait, scale=min_resize:-2 for landscape
+        # -2 ensures dimensions are divisible by 2 (required for many codecs)
+        
+        duration = end_time - start_time
+        
+        # First get video dimensions to determine orientation
         probe = ffmpeg.probe(video_path)
         video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
         width = int(video_info['width'])
         height = int(video_info['height'])
         
-        # Extract frames
-        duration = end_time - start_time
+        # Scale so shorter side = min_resize
+        if width < height:
+            # Portrait/vertical: width is shorter
+            scale_filter = f'{min_resize}:-2'
+            new_width = min_resize
+            new_height = int(height * min_resize / width)
+            new_height = new_height - (new_height % 2)  # Make even
+        else:
+            # Landscape/horizontal: height is shorter
+            scale_filter = f'-2:{min_resize}'
+            new_height = min_resize
+            new_width = int(width * min_resize / height)
+            new_width = new_width - (new_width % 2)  # Make even
+        
         out, _ = (
             ffmpeg
             .input(video_path, ss=start_time, t=duration)
             .filter('fps', fps=target_fps)
+            .filter('scale', scale_filter)
             .output('pipe:', format='rawvideo', pix_fmt='rgb24')
             .run(capture_stdout=True, capture_stderr=True, quiet=True)
         )
         
         # Convert to numpy array
-        frames = np.frombuffer(out, np.uint8).reshape([-1, height, width, 3])
+        frames = np.frombuffer(out, np.uint8).reshape([-1, new_height, new_width, 3])
         return [frame for frame in frames]
         
     except Exception as e:
@@ -198,7 +220,8 @@ def create_sequence_example(video_path: str, start_time: float, end_time: float,
                            audio_sample_rate: int = 16000,
                            n_mels: int = 128,
                            win_length_ms: float = 25.0,
-                           hop_length_ms: float = 10.0) -> tf.train.SequenceExample:
+                           hop_length_ms: float = 10.0,
+                           min_resize: int = 256) -> tf.train.SequenceExample:
     """Create a SequenceExample for one video clip.
     
     Args:
@@ -214,12 +237,13 @@ def create_sequence_example(video_path: str, start_time: float, end_time: float,
         n_mels: Number of mel bins.
         win_length_ms: Window length in ms.
         hop_length_ms: Hop length in ms.
+        min_resize: Resize frames so shortest side equals this (default 256).
         
     Returns:
         A tf.train.SequenceExample.
     """
-    # Extract RGB frames
-    frames = extract_frames_ffmpeg(video_path, start_time, end_time, target_fps)
+    # Extract RGB frames with aspect-ratio-preserving resize
+    frames = extract_frames_ffmpeg(video_path, start_time, end_time, target_fps, min_resize)
     
     if not frames:
         raise ValueError(f"No frames extracted from {video_path}")
