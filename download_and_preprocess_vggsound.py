@@ -105,18 +105,17 @@ def download_youtube_video(video_id: str, start_time: int, output_path: str,
                 return False
             # else: duration is sufficient, proceed with download
         
-        # Use yt-dlp's native segment extraction with optimized settings for speed
+        # Download full video at lowest quality (faster than you'd think for "worst")
+        # Let ffmpeg handle the segment extraction for better compatibility
         cmd = [
             'yt-dlp',
             '--quiet',
             '--no-warnings',
-            '--format', 'worst[ext=mp4]/worst[ext=webm]/worst',  # Prefer mp4, fallback to webm or any
-            '--download-sections', f'*{start_time}-{start_time+10}',
+            '--format', 'worst[ext=mp4]/worst',  # Lowest quality, prefer mp4
             '--output', output_path,
             '--no-playlist',
             '--concurrent-fragments', '4',  # Download fragments in parallel
             '--throttled-rate', '100K',  # Skip if speed drops below 100KB/s
-            '--remux-video', 'mp4',  # Force remux to mp4 if needed
             url
         ]
         
@@ -173,11 +172,11 @@ def process_video_entry(row: dict, temp_dir: str, **kwargs) -> Optional[tf.train
                                      check_duration=FLAGS.check_duration):
             return None
         
-        # Process video
+        # Process video - extract the specific segment with ffmpeg
         sequence_example = gen_module.create_sequence_example(
             video_path=temp_video,
-            start_time=0,  # We already downloaded the specific segment
-            end_time=10,   # 10 second clips
+            start_time=start_time,  # Extract from full video
+            end_time=end_time,      # 10 second clips
             label=label,
             clip_id=clip_id,
             **kwargs
