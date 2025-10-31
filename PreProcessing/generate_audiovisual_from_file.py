@@ -109,6 +109,9 @@ def extract_frames_ffmpeg(video_path: str, start_time: float, end_time: float,
         frames = np.frombuffer(out, np.uint8).reshape([-1, new_height, new_width, 3])
         return [frame for frame in frames]
         
+    except ffmpeg.Error as e:
+        logging.error(f"FFmpeg error extracting frames from {video_path}: {e.stderr.decode() if e.stderr else str(e)}")
+        return []
     except Exception as e:
         logging.error(f"Error extracting frames from {video_path}: {e}")
         return []
