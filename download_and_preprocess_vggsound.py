@@ -110,12 +110,13 @@ def download_youtube_video(video_id: str, start_time: int, output_path: str,
             'yt-dlp',
             '--quiet',
             '--no-warnings',
-            '--format', 'worst[ext=mp4]/worst',  # Download lowest quality for speed (we resize to 256 anyway!)
+            '--format', 'worst[ext=mp4]/worst[ext=webm]/worst',  # Prefer mp4, fallback to webm or any
             '--download-sections', f'*{start_time}-{start_time+10}',
             '--output', output_path,
             '--no-playlist',
             '--concurrent-fragments', '4',  # Download fragments in parallel
             '--throttled-rate', '100K',  # Skip if speed drops below 100KB/s
+            '--remux-video', 'mp4',  # Force remux to mp4 if needed
             url
         ]
         
