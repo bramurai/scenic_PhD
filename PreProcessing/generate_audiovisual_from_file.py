@@ -106,24 +106,21 @@ def extract_frames_ffmpeg(video_path: str, start_time: float, end_time: float,
         )
         
         # Convert to numpy array
-        # Calculate actual frame dimensions from the output
-        # Each pixel is 3 bytes (RGB)
-        total_bytes = len(out)
-        expected_frames = int(duration * target_fps)
-        bytes_per_frame = total_bytes // expected_frames
-        
-        # bytes_per_frame = height * width * 3
-        # We know one dimension (min_resize), calculate the other
+        # We scaled to have one dimension = min_resize, but don't know exact other dimension
+        # Use -1 to let numpy infer one dimension
         if width < height:
-            # We scaled width to min_resize, calculate actual height
-            actual_width = min_resize
-            actual_height = bytes_per_frame // (min_resize * 3)
+            # Width was scaled to min_resize, height is unknown but constrained
+            frames = np.frombuffer(out, np.uint8).reshape([-1, min_resize, 3])
         else:
-            # We scaled height to min_resize, calculate actual width  
-            actual_height = min_resize
-            actual_width = bytes_per_frame // (min_resize * 3)
+            # Height was scaled to min_resize, need to figure out actual layout
+            # Total pixels = len(out) / 3
+            # frames * height * width = total pixels
+            # We know height = min_resize, so frames * width = total_pixels / min_resize
+            total_pixels = len(out) // 3
+            num_frames = int(duration * target_fps)
+            actual_width = total_pixels // (num_frames * min_resize)
+            frames = np.frombuffer(out, np.uint8).reshape([num_frames, min_resize, actual_width, 3])
         
-        frames = np.frombuffer(out, np.uint8).reshape([expected_frames, actual_height, actual_width, 3])
         return [frame for frame in frames]
         
     except ffmpeg.Error as e:
