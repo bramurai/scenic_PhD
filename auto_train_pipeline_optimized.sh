@@ -79,7 +79,8 @@ while true; do
     # Check if all batches are downloaded
     ALL_DONE=true
     for BATCH_ID in "${ALL_BATCHES[@]}"; do
-        if [ "${BATCH_STATUS[$BATCH_ID]}" != "downloaded" ] && [ "${BATCH_STATUS[$BATCH_ID]}" != "failed" ]; then
+        STATUS="${BATCH_STATUS[$BATCH_ID]}"
+        if [ "$STATUS" != "downloaded" ] && [ "$STATUS" != "failed" ]; then
             ALL_DONE=false
             break
         fi
@@ -91,25 +92,19 @@ while true; do
     
     # Check for completed batches and start downloads
     for BATCH_ID in "${ALL_BATCHES[@]}"; do
-        if [ "${BATCH_STATUS[$BATCH_ID]}" = "submitted" ]; then
+        if [ "${BATCH_STATUS[$BATCH_ID]}" = "submitted" ] || [ "${BATCH_STATUS[$BATCH_ID]}" = "completed" ]; then
             # Check if archive exists (job completed)
             if ssh bravhee@mentat001 "test -f ~/scenic_PhD/PreProcessing/train_batch_${BATCH_ID}.tar.gz" 2>/dev/null; then
-                BATCH_STATUS[$BATCH_ID]="completed"
+                # Only mark as completed if not already downloading
+                if [ "${BATCH_STATUS[$BATCH_ID]}" = "submitted" ]; then
+                    BATCH_STATUS[$BATCH_ID]="completed"
+                fi
                 
-                # Start download in background if not at limit
-                if [ $ACTIVE_DOWNLOADS -lt $PARALLEL_DOWNLOADS ]; then
+                # Start download in background if not already downloading and not at limit
+                if [ "${BATCH_STATUS[$BATCH_ID]}" = "completed" ] && [ $ACTIVE_DOWNLOADS -lt $PARALLEL_DOWNLOADS ]; then
+                    BATCH_STATUS[$BATCH_ID]="downloading"
                     download_batch $BATCH_ID &
                     ACTIVE_DOWNLOADS=$((ACTIVE_DOWNLOADS + 1))
-                fi
-            else
-                # Check if job is no longer in queue (completed without archive = failed)
-                START_ROW=$((10#$BATCH_ID))  # Remove leading zeros
-                JOB_EXISTS=$(ssh bravhee@mentat001 "squeue -u bravhee -n vggsound_train_micro -h" 2>/dev/null | grep -c "vggsound_train_micro")
-                
-                # If no jobs running and archive doesn't exist, mark as failed
-                if [ $JOB_EXISTS -eq 0 ]; then
-                    echo "[$(date +%H:%M:%S)] ✗ Batch $BATCH_ID failed (no archive created)"
-                    BATCH_STATUS[$BATCH_ID]="failed"
                 fi
             fi
         fi
@@ -118,8 +113,29 @@ while true; do
         ACTIVE_DOWNLOADS=$(jobs -r | wc -l)
     done
     
-    # Progress update
-    DOWNLOADED=$(printf '%s\n' "${BATCH_STATUS[@]}" | grep -c "downloaded")
+    # Check for failed batches (jobs completed but no archive) - only after all jobs are done
+    RUNNING=$(ssh bravhee@mentat001 "squeue -u bravhee -n vggsound_train_micro -h | wc -l" 2>/dev/null || echo "0")
+    if [ $RUNNING -eq 0 ]; then
+        for BATCH_ID in "${ALL_BATCHES[@]}"; do
+            if [ "${BATCH_STATUS[$BATCH_ID]}" = "submitted" ]; then
+                # No archive and no jobs running = failed
+                if ! ssh bravhee@mentat001 "test -f ~/scenic_PhD/PreProcessing/train_batch_${BATCH_ID}.tar.gz" 2>/dev/null; then
+                    echo "[$(date +%H:%M:%S)] ✗ Batch $BATCH_ID failed (no archive created)"
+                    BATCH_STATUS[$BATCH_ID]="failed"
+                fi
+            fi
+        done
+    fi
+    
+    # Progress update - count actual downloaded files since background jobs can't update the array
+    DOWNLOADED=0
+    for BATCH_ID in "${ALL_BATCHES[@]}"; do
+        if [ -f "$LAPTOP_DIR/train_batch_${BATCH_ID}.tar.gz" ]; then
+            BATCH_STATUS[$BATCH_ID]="downloaded"
+            DOWNLOADED=$((DOWNLOADED + 1))
+        fi
+    done
+    
     TOTAL=${#ALL_BATCHES[@]}
     RUNNING=$(ssh bravhee@mentat001 "squeue -u bravhee -n vggsound_train_micro -h | wc -l" 2>/dev/null || echo "0")
     
@@ -133,8 +149,18 @@ wait
 
 echo ""
 echo "=== TRAINING Pipeline Complete (OPTIMIZED)! ==="
-DOWNLOADED=$(printf '%s\n' "${BATCH_STATUS[@]}" | grep -c "downloaded")
-FAILED=$(printf '%s\n' "${BATCH_STATUS[@]}" | grep -c "failed")
+
+# Count actual downloaded files
+DOWNLOADED=0
+FAILED=0
+for BATCH_ID in "${ALL_BATCHES[@]}"; do
+    if [ -f "$LAPTOP_DIR/train_batch_${BATCH_ID}.tar.gz" ]; then
+        DOWNLOADED=$((DOWNLOADED + 1))
+    else
+        FAILED=$((FAILED + 1))
+    fi
+done
+
 echo "Downloaded: $DOWNLOADED batches"
 echo "Failed: $FAILED batches"
 echo "Location: $LAPTOP_DIR"

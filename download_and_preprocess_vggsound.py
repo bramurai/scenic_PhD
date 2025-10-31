@@ -318,7 +318,7 @@ def main(argv):
             save_progress(processed_indices)
         
         # Clean temp directory periodically
-        if idx % FLAGS.batch_size == 0:
+        if idx % FLAGS.batch_size == 0 and os.path.exists(temp_dir):
             for f in os.listdir(temp_dir):
                 try:
                     os.remove(os.path.join(temp_dir, f))
