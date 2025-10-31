@@ -12,9 +12,8 @@ END_ROW=${2:-100}
 BATCH_ID=$(printf "%05d" $START_ROW)
 
 # Activate conda environment
-module load anaconda3 2>/dev/null || true
-source $(conda info --base)/etc/profile.d/conda.sh
-conda activate scenic_preprocessing
+module load anaconda3
+source activate scenic_preprocessing
 
 export KMP_DUPLICATE_LIB_OK=TRUE
 
