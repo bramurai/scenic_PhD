@@ -85,13 +85,13 @@ def extract_frames_ffmpeg(video_path: str, start_time: float, end_time: float,
         # Scale so shorter side = min_resize
         if width < height:
             # Portrait/vertical: width is shorter
-            scale_filter = f'{min_resize}:-2'
+            scale_w, scale_h = min_resize, -2
             new_width = min_resize
             new_height = int(height * min_resize / width)
             new_height = new_height - (new_height % 2)  # Make even
         else:
             # Landscape/horizontal: height is shorter
-            scale_filter = f'-2:{min_resize}'
+            scale_w, scale_h = -2, min_resize
             new_height = min_resize
             new_width = int(width * min_resize / height)
             new_width = new_width - (new_width % 2)  # Make even
@@ -100,7 +100,7 @@ def extract_frames_ffmpeg(video_path: str, start_time: float, end_time: float,
             ffmpeg
             .input(video_path, ss=start_time, t=duration)
             .filter('fps', fps=target_fps)
-            .filter('scale', scale_filter)
+            .filter('scale', w=scale_w, h=scale_h)
             .output('pipe:', format='rawvideo', pix_fmt='rgb24')
             .run(capture_stdout=True, capture_stderr=True, quiet=True)
         )
