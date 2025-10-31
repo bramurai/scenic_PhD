@@ -106,20 +106,38 @@ def extract_frames_ffmpeg(video_path: str, start_time: float, end_time: float,
         )
         
         # Convert to numpy array
-        # We scaled to have one dimension = min_resize, but don't know exact other dimension
-        # Use -1 to let numpy infer one dimension
+        # ffmpeg outputs raw frames, we need to reshape based on actual output size
+        # The issue is that calculated dimensions might not match exactly due to rounding
+        # So we calculate actual dimensions from the data size
+        total_bytes = len(out)
+        total_pixels = total_bytes // 3  # RGB = 3 bytes per pixel
+        
+        # We know one dimension is min_resize, calculate the rest
+        # For landscape: scaled height to min_resize, so height = min_resize
+        # For portrait: scaled width to min_resize, so width = min_resize
+        
         if width < height:
-            # Width was scaled to min_resize, height is unknown but constrained
+            # Portrait: width = min_resize
+            # total_pixels = num_frames * height * width
+            # Use -1 to let numpy infer: reshape to [num_frames * height, width, 3]
             frames = np.frombuffer(out, np.uint8).reshape([-1, min_resize, 3])
         else:
-            # Height was scaled to min_resize, need to figure out actual layout
-            # Total pixels = len(out) / 3
-            # frames * height * width = total pixels
-            # We know height = min_resize, so frames * width = total_pixels / min_resize
-            total_pixels = len(out) // 3
+            # Landscape: height = min_resize  
+            # We want final shape [num_frames, height, width, 3]
+            # But we need to calculate width first
+            # total_pixels / height = num_frames * width
+            frames_times_width = total_pixels // min_resize
+            # Now reshape: [num_frames * width, height, 3] then reshape again
+            # Actually, let's use -1: reshape([-1, min_resize, something, 3])
+            # No, that won't work. Let me calculate width explicitly
             num_frames = int(duration * target_fps)
             actual_width = total_pixels // (num_frames * min_resize)
-            frames = np.frombuffer(out, np.uint8).reshape([num_frames, min_resize, actual_width, 3])
+            # Now check if this is exact
+            if num_frames * min_resize * actual_width * 3 != total_bytes:
+                # Not exact, use -1 to infer num_frames
+                frames = np.frombuffer(out, np.uint8).reshape([-1, min_resize, actual_width, 3])
+            else:
+                frames = np.frombuffer(out, np.uint8).reshape([num_frames, min_resize, actual_width, 3])
         
         return [frame for frame in frames]
         
