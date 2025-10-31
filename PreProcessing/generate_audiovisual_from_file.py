@@ -106,9 +106,7 @@ def extract_frames_ffmpeg(video_path: str, start_time: float, end_time: float,
         )
         
         # Convert to numpy array
-        # Use the pre-calculated dimensions (new_height, new_width are already even)
         frames = np.frombuffer(out, np.uint8).reshape([-1, new_height, new_width, 3])
-        
         return [frame for frame in frames]
         
     except ffmpeg.Error as e:
