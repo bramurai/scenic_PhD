@@ -85,16 +85,16 @@ def extract_frames_ffmpeg(video_path: str, start_time: float, end_time: float,
         # Scale so shorter side = min_resize
         if width < height:
             # Portrait/vertical: width is shorter
-            scale_w, scale_h = min_resize, -2
             new_width = min_resize
             new_height = int(height * min_resize / width)
             new_height = new_height - (new_height % 2)  # Make even
+            scale_w, scale_h = new_width, new_height
         else:
             # Landscape/horizontal: height is shorter
-            scale_w, scale_h = -2, min_resize
             new_height = min_resize
             new_width = int(width * min_resize / height)
             new_width = new_width - (new_width % 2)  # Make even
+            scale_w, scale_h = new_width, new_height
         
         out, _ = (
             ffmpeg
