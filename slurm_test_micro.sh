@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=vggsound_test_micro
-#SBATCH --output=$HOME/scenic_PhD/logs/test_micro_%A.out
-#SBATCH --error=$HOME/scenic_PhD/logs/test_micro_%A.err
+#SBATCH --output=/home/mpla/bravhee/scenic_PhD/logs/test_micro_%A.out
+#SBATCH --error=/home/mpla/bravhee/scenic_PhD/logs/test_micro_%A.err
 #SBATCH --time=4:00:00
 #SBATCH --mem=16G
 #SBATCH --cpus-per-task=4
