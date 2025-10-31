@@ -2,7 +2,7 @@
 # OPTIMIZED: Download batches immediately as they complete (parallel download) - TRAINING
 
 TOTAL_VIDEOS=500 # 183971  # Training set size
-BATCH_SIZE=200  # Process 200 videos at a time (~1.1GB each)
+BATCH_SIZE=50  # Process 200 videos at a time (~1.1GB each)
 PARALLEL_JOBS=25  # Run 25 jobs simultaneously
 PARALLEL_DOWNLOADS=25  # Download 25 batches simultaneously (1 Gbps connection can handle it!)
 LAPTOP_DIR="$1"
@@ -100,6 +100,16 @@ while true; do
                 if [ $ACTIVE_DOWNLOADS -lt $PARALLEL_DOWNLOADS ]; then
                     download_batch $BATCH_ID &
                     ACTIVE_DOWNLOADS=$((ACTIVE_DOWNLOADS + 1))
+                fi
+            else
+                # Check if job is no longer in queue (completed without archive = failed)
+                START_ROW=$((10#$BATCH_ID))  # Remove leading zeros
+                JOB_EXISTS=$(ssh bravhee@mentat001 "squeue -u bravhee -n vggsound_train_micro -h" 2>/dev/null | grep -c "vggsound_train_micro")
+                
+                # If no jobs running and archive doesn't exist, mark as failed
+                if [ $JOB_EXISTS -eq 0 ]; then
+                    echo "[$(date +%H:%M:%S)] ✗ Batch $BATCH_ID failed (no archive created)"
+                    BATCH_STATUS[$BATCH_ID]="failed"
                 fi
             fi
         fi
