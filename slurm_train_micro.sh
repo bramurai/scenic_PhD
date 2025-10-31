@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=vggsound_train_micro
-#SBATCH --output=logs/train_micro_%A.out
-#SBATCH --error=logs/train_micro_%A.err
+#SBATCH --output=$HOME/scenic_PhD/logs/train_micro_%A.out
+#SBATCH --error=$HOME/scenic_PhD/logs/train_micro_%A.err
 #SBATCH --time=4:00:00
 #SBATCH --mem=16G
 #SBATCH --cpus-per-task=4
@@ -13,8 +13,7 @@ BATCH_ID=$(printf "%05d" $START_ROW)
 
 # Activate conda environment
 module load anaconda3 2>/dev/null || true
-source $(conda info --base)/etc/profile.d/conda.sh
-conda activate scenic_preprocessing
+source activate scenic_preprocessing
 
 export KMP_DUPLICATE_LIB_OK=TRUE
 
@@ -23,7 +22,7 @@ TEMP_DIR="$HOME/scenic_PhD/PreProcessing/temp_train_micro"
 
 mkdir -p $OUTPUT_DIR
 mkdir -p $TEMP_DIR
-mkdir -p logs
+mkdir -p $HOME/scenic_PhD/logs
 
 echo "=== Processing TRAINING Videos $START_ROW to $END_ROW ==="
 echo "Output: $OUTPUT_DIR"
