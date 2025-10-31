@@ -106,7 +106,24 @@ def extract_frames_ffmpeg(video_path: str, start_time: float, end_time: float,
         )
         
         # Convert to numpy array
-        frames = np.frombuffer(out, np.uint8).reshape([-1, new_height, new_width, 3])
+        # Calculate actual frame dimensions from the output
+        # Each pixel is 3 bytes (RGB)
+        total_bytes = len(out)
+        expected_frames = int(duration * target_fps)
+        bytes_per_frame = total_bytes // expected_frames
+        
+        # bytes_per_frame = height * width * 3
+        # We know one dimension (min_resize), calculate the other
+        if width < height:
+            # We scaled width to min_resize, calculate actual height
+            actual_width = min_resize
+            actual_height = bytes_per_frame // (min_resize * 3)
+        else:
+            # We scaled height to min_resize, calculate actual width  
+            actual_height = min_resize
+            actual_width = bytes_per_frame // (min_resize * 3)
+        
+        frames = np.frombuffer(out, np.uint8).reshape([expected_frames, actual_height, actual_width, 3])
         return [frame for frame in frames]
         
     except ffmpeg.Error as e:
