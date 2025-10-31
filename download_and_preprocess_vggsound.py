@@ -153,7 +153,11 @@ def process_video_entry(row: dict, temp_dir: str, **kwargs) -> Optional[tf.train
     Returns:
         SequenceExample or None if processing failed.
     """
-    video_id = row['video_path'].split('_')[0]  # Extract video_id from path
+    # Extract video_id: remove the last part after underscore and .mp4 extension
+    # Example: "---g-f_I2yQ_000001.mp4" -> "---g-f_I2yQ"
+    video_path = row['video_path']
+    video_id = video_path.rsplit('_', 1)[0]  # Split from right, keep left part
+    
     start_time = int(row['start'])
     end_time = int(row['end'])
     label = row.get('label')

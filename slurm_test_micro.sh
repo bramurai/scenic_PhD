@@ -11,6 +11,11 @@ START_ROW=${1:-0}
 END_ROW=${2:-100}
 BATCH_ID=$(printf "%05d" $START_ROW)
 
+# Activate conda environment
+module load anaconda3 2>/dev/null || true
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate scenic_preprocessing
+
 export KMP_DUPLICATE_LIB_OK=TRUE
 
 OUTPUT_DIR="$HOME/scenic_PhD/PreProcessing/tfrecords_test_micro/batch_${BATCH_ID}"
@@ -27,8 +32,11 @@ df -h $HOME | tail -1
 
 cd $HOME/scenic_PhD
 
-# Create a temporary CSV with just these rows (skip header)
-head -n $((END_ROW + 2)) PreProcessing/vggsound_test.csv | tail -n $((END_ROW - START_ROW + 1)) > /tmp/vggsound_test_micro_${BATCH_ID}.csv
+# Create a temporary CSV with just these rows
+# Row numbers are 0-indexed (row 0 is first data row after header)
+# Add 1 for header, add 1 for inclusive end row
+HEADER_OFFSET=1
+head -n $((END_ROW + HEADER_OFFSET + 1)) PreProcessing/vggsound_test.csv | tail -n $((END_ROW - START_ROW)) > /tmp/vggsound_test_micro_${BATCH_ID}.csv
 
 # Add header
 head -n 1 PreProcessing/vggsound_test.csv > /tmp/vggsound_test_batch_${BATCH_ID}.csv
