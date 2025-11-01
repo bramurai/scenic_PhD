@@ -1,8 +1,8 @@
 #!/bin/bash
 # OPTIMIZED: Download batches immediately as they complete (parallel download)
 
-TOTAL_VIDEOS=600 # 15122  # Test set size
-BATCH_SIZE=50  # Process 200 videos at a time (~1.1GB each)
+TOTAL_VIDEOS=15122  # Test set size
+BATCH_SIZE=200  # Process 200 videos at a time (~1.1GB each)
 PARALLEL_JOBS=25  # Run 25 jobs simultaneously
 PARALLEL_DOWNLOADS=25  # Download 25 batches simultaneously (1 Gbps connection can handle it!)
 LAPTOP_DIR="$1"
@@ -33,11 +33,11 @@ download_batch() {
     
     echo "[$(date +%H:%M:%S)] Downloading $ARCHIVE..."
     
-    if scp -q bravhee@mentat001:~/scenic_PhD/PreProcessing/$ARCHIVE "$LAPTOP_DIR/" 2>/dev/null; then
+    if scp -q bravhee@mentat001.dccn.nl:~/scenic_PhD/PreProcessing/$ARCHIVE "$LAPTOP_DIR/" 2>/dev/null; then
         echo "[$(date +%H:%M:%S)] ✓ Downloaded: $ARCHIVE"
         
         # Delete from cluster
-        ssh bravhee@mentat001 "rm ~/scenic_PhD/PreProcessing/$ARCHIVE; rm -rf ~/scenic_PhD/PreProcessing/tfrecords_test_micro/batch_${BATCH_ID}" 2>/dev/null
+        ssh bravhee@mentat001.dccn.nl "rm ~/scenic_PhD/PreProcessing/$ARCHIVE; rm -rf ~/scenic_PhD/PreProcessing/tfrecords_test_micro/batch_${BATCH_ID}" 2>/dev/null
         echo "[$(date +%H:%M:%S)] ✓ Cleaned up cluster: batch_${BATCH_ID}"
         
         BATCH_STATUS[$BATCH_ID]="downloaded"
@@ -54,13 +54,13 @@ for START in $(seq 0 $BATCH_SIZE $((TOTAL_VIDEOS - BATCH_SIZE))); do
     BATCH_ID=$(printf "%05d" $START)
     
     # Wait if too many jobs running
-    RUNNING=$(ssh bravhee@mentat001 "squeue -u bravhee -n vggsound_test_micro -h | wc -l")
+    RUNNING=$(ssh bravhee@mentat001.dccn.nl "squeue -u bravhee -n vggsound_test_micro -h | wc -l")
     while [ $RUNNING -ge $PARALLEL_JOBS ]; do
         sleep 10
-        RUNNING=$(ssh bravhee@mentat001 "squeue -u bravhee -n vggsound_test_micro -h | wc -l")
+        RUNNING=$(ssh bravhee@mentat001.dccn.nl "squeue -u bravhee -n vggsound_test_micro -h | wc -l")
     done
     
-    ssh bravhee@mentat001 "cd scenic_PhD && sbatch slurm_test_micro.sh $START $END" > /dev/null 2>&1
+    ssh bravhee@mentat001.dccn.nl "cd scenic_PhD && sbatch slurm_test_micro.sh $START $END" > /dev/null 2>&1
     sleep 1
     
     BATCH_STATUS[$BATCH_ID]="submitted"
@@ -93,7 +93,7 @@ while true; do
     for BATCH_ID in "${ALL_BATCHES[@]}"; do
         if [ "${BATCH_STATUS[$BATCH_ID]}" = "submitted" ]; then
             # Check if archive exists (job completed)
-            if ssh bravhee@mentat001 "test -f ~/scenic_PhD/PreProcessing/test_batch_${BATCH_ID}.tar.gz" 2>/dev/null; then
+            if ssh bravhee@mentat001.dccn.nl "test -f ~/scenic_PhD/PreProcessing/test_batch_${BATCH_ID}.tar.gz" 2>/dev/null; then
                 BATCH_STATUS[$BATCH_ID]="completed"
                 
                 # Start download in background if not at limit
@@ -111,7 +111,7 @@ while true; do
     # Progress update
     DOWNLOADED=$(printf '%s\n' "${BATCH_STATUS[@]}" | grep -c "downloaded")
     TOTAL=${#ALL_BATCHES[@]}
-    RUNNING=$(ssh bravhee@mentat001 "squeue -u bravhee -n vggsound_test_micro -h | wc -l" 2>/dev/null || echo "0")
+    RUNNING=$(ssh bravhee@mentat001.dccn.nl "squeue -u bravhee -n vggsound_test_micro -h | wc -l" 2>/dev/null || echo "0")
     
     echo "[$(date +%H:%M:%S)] Progress: $DOWNLOADED/$TOTAL downloaded, $RUNNING jobs running, $ACTIVE_DOWNLOADS downloads active"
     

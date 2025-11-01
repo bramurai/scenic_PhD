@@ -33,11 +33,11 @@ download_batch() {
     
     echo "[$(date +%H:%M:%S)] Downloading $ARCHIVE..."
     
-    if scp -q bravhee@mentat001:~/scenic_PhD/PreProcessing/$ARCHIVE "$LAPTOP_DIR/" 2>/dev/null; then
+    if scp -q bravhee@mentat001.dccn.nl:~/scenic_PhD/PreProcessing/$ARCHIVE "$LAPTOP_DIR/" 2>/dev/null; then
         echo "[$(date +%H:%M:%S)] ✓ Downloaded: $ARCHIVE"
         
         # Delete from cluster
-        ssh bravhee@mentat001 "rm ~/scenic_PhD/PreProcessing/$ARCHIVE; rm -rf ~/scenic_PhD/PreProcessing/tfrecords_train_micro/batch_${BATCH_ID}" 2>/dev/null
+        ssh bravhee@mentat001.dccn.nl "rm ~/scenic_PhD/PreProcessing/$ARCHIVE; rm -rf ~/scenic_PhD/PreProcessing/tfrecords_train_micro/batch_${BATCH_ID}" 2>/dev/null
         echo "[$(date +%H:%M:%S)] ✓ Cleaned up cluster: batch_${BATCH_ID}"
         
         BATCH_STATUS[$BATCH_ID]="downloaded"
@@ -54,13 +54,13 @@ for START in $(seq 0 $BATCH_SIZE $((TOTAL_VIDEOS - BATCH_SIZE))); do
     BATCH_ID=$(printf "%05d" $START)
     
     # Wait if too many jobs running
-    RUNNING=$(ssh bravhee@mentat001 "squeue -u bravhee -n vggsound_train_micro -h | wc -l")
+    RUNNING=$(ssh bravhee@mentat001.dccn.nl "squeue -u bravhee -n vggsound_train_micro -h | wc -l")
     while [ $RUNNING -ge $PARALLEL_JOBS ]; do
         sleep 10
-        RUNNING=$(ssh bravhee@mentat001 "squeue -u bravhee -n vggsound_train_micro -h | wc -l")
+        RUNNING=$(ssh bravhee@mentat001.dccn.nl "squeue -u bravhee -n vggsound_train_micro -h | wc -l")
     done
     
-    ssh bravhee@mentat001 "cd scenic_PhD && sbatch slurm_train_micro.sh $START $END" > /dev/null 2>&1
+    ssh bravhee@mentat001.dccn.nl "cd scenic_PhD && sbatch slurm_train_micro.sh $START $END" > /dev/null 2>&1
     sleep 1
     
     BATCH_STATUS[$BATCH_ID]="submitted"
@@ -94,7 +94,7 @@ while true; do
     for BATCH_ID in "${ALL_BATCHES[@]}"; do
         if [ "${BATCH_STATUS[$BATCH_ID]}" = "submitted" ] || [ "${BATCH_STATUS[$BATCH_ID]}" = "completed" ]; then
             # Check if archive exists (job completed)
-            if ssh bravhee@mentat001 "test -f ~/scenic_PhD/PreProcessing/train_batch_${BATCH_ID}.tar.gz" 2>/dev/null; then
+            if ssh bravhee@mentat001.dccn.nl "test -f ~/scenic_PhD/PreProcessing/train_batch_${BATCH_ID}.tar.gz" 2>/dev/null; then
                 # Only mark as completed if not already downloading
                 if [ "${BATCH_STATUS[$BATCH_ID]}" = "submitted" ]; then
                     BATCH_STATUS[$BATCH_ID]="completed"
@@ -114,12 +114,12 @@ while true; do
     done
     
     # Check for failed batches (jobs completed but no archive) - only after all jobs are done
-    RUNNING=$(ssh bravhee@mentat001 "squeue -u bravhee -n vggsound_train_micro -h | wc -l" 2>/dev/null || echo "0")
+    RUNNING=$(ssh bravhee@mentat001.dccn.nl "squeue -u bravhee -n vggsound_train_micro -h | wc -l" 2>/dev/null || echo "0")
     if [ $RUNNING -eq 0 ]; then
         for BATCH_ID in "${ALL_BATCHES[@]}"; do
             if [ "${BATCH_STATUS[$BATCH_ID]}" = "submitted" ]; then
                 # No archive and no jobs running = failed
-                if ! ssh bravhee@mentat001 "test -f ~/scenic_PhD/PreProcessing/train_batch_${BATCH_ID}.tar.gz" 2>/dev/null; then
+                if ! ssh bravhee@mentat001.dccn.nl "test -f ~/scenic_PhD/PreProcessing/train_batch_${BATCH_ID}.tar.gz" 2>/dev/null; then
                     echo "[$(date +%H:%M:%S)] ✗ Batch $BATCH_ID failed (no archive created)"
                     BATCH_STATUS[$BATCH_ID]="failed"
                 fi
@@ -137,7 +137,7 @@ while true; do
     done
     
     TOTAL=${#ALL_BATCHES[@]}
-    RUNNING=$(ssh bravhee@mentat001 "squeue -u bravhee -n vggsound_train_micro -h | wc -l" 2>/dev/null || echo "0")
+    RUNNING=$(ssh bravhee@mentat001.dccn.nl "squeue -u bravhee -n vggsound_train_micro -h | wc -l" 2>/dev/null || echo "0")
     
     echo "[$(date +%H:%M:%S)] Progress: $DOWNLOADED/$TOTAL downloaded, $RUNNING jobs running, $ACTIVE_DOWNLOADS downloads active"
     
