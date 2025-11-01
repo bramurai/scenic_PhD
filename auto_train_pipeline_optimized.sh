@@ -3,7 +3,7 @@
 
 TOTAL_VIDEOS=183971  # Training set size
 BATCH_SIZE=200  # Process 200 videos at a time (~1.1GB each)
-PARALLEL_JOBS=25  # Run 25 jobs simultaneously per chunk
+PARALLEL_JOBS=10  # Run 10 jobs simultaneously (reduced to avoid rate limiting)
 PARALLEL_DOWNLOADS=25  # Download 25 batches simultaneously (1 Gbps connection can handle it!)
 LAPTOP_DIR="$1"
 
