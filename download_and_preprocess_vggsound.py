@@ -45,6 +45,9 @@ flags.DEFINE_integer('save_progress_every', 50, 'Save progress every N videos.')
 flags.DEFINE_bool('check_duration', True, 'Verify video duration before downloading segment.')
 flags.DEFINE_string('cookies_from_browser', None, 'Browser to extract cookies from (chrome, firefox, edge, etc).')
 flags.DEFINE_string('cookies_file', None, 'Path to cookies.txt file for yt-dlp authentication.')
+flags.DEFINE_string('local_videos_dir', None, 'If set, treat video paths as relative to this directory and use local mp4 files instead of downloading from YouTube.')
+flags.DEFINE_bool('require_local', False, 'If True and local_videos_dir is set, skip videos not found locally instead of falling back to YouTube download.')
+flags.DEFINE_bool('local_are_clips', False, 'If True, local videos are already 10s clips (extract 0-10s instead of using CSV start/end times).')
 
 flags.mark_flag_as_required('csv_path')
 flags.mark_flag_as_required('output_path')
@@ -67,7 +70,7 @@ def get_video_duration(video_id: str) -> Optional[float]:
             '--no-warnings',
             '--print', 'duration',
             '--no-playlist',
-            '--sleep-requests', '3',  # Sleep 3 seconds between requests to avoid rate limiting
+            '--sleep-requests', '1',  # Sleep 1 second between requests to avoid rate limiting
         ]
         
         # Add cookie authentication if provided
@@ -84,6 +87,29 @@ def get_video_duration(video_id: str) -> Optional[float]:
             return float(result.stdout.strip())
         return None
             
+    except Exception:
+        return None
+
+
+def get_local_video_duration(file_path: str) -> Optional[float]:
+    """Get duration of a local video file using ffprobe.
+
+    Returns duration in seconds or None if it cannot be determined.
+    """
+    try:
+        # ffprobe returns duration on a single line with -show_entries format=duration
+        cmd = [
+            'ffprobe',
+            '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'format=duration',
+            '-of', 'default=nw=1:nk=1',
+            file_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=20, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            return float(result.stdout.strip())
+        return None
     except Exception:
         return None
 
@@ -126,7 +152,7 @@ def download_youtube_video(video_id: str, start_time: int, output_path: str,
             '--no-playlist',
             '--concurrent-fragments', '4',  # Download fragments in parallel
             '--throttled-rate', '100K',  # Skip if speed drops below 100KB/s
-            '--sleep-requests', '3',  # Sleep 3 seconds between requests to avoid rate limiting
+            '--sleep-requests', '1',  # Sleep 1 second between requests to avoid rate limiting
         ]
         
         # Add cookie authentication if provided
@@ -160,7 +186,7 @@ def download_youtube_video(video_id: str, start_time: int, output_path: str,
         return False
 
 
-def process_video_entry(row: dict, temp_dir: str, **kwargs) -> Optional[tf.train.SequenceExample]:
+def process_video_entry(row: dict, temp_dir: str, **kwargs) -> Optional[object]:
     """Download video temporarily, process it, and delete it.
     
     Args:
@@ -183,13 +209,45 @@ def process_video_entry(row: dict, temp_dir: str, **kwargs) -> Optional[tf.train
     
     # Create temporary file for video
     temp_video = os.path.join(temp_dir, f"{clip_id}.mp4")
+    delete_temp = True
     
     try:
-        # Download video
-        if not download_youtube_video(video_id, start_time, temp_video, 
-                                     check_duration=FLAGS.check_duration):
-            return None
-        
+        # If a local videos directory is provided, prefer local files and skip download
+        if FLAGS.local_videos_dir:
+            # The CSV may contain filenames like '..._000001.mp4' or full paths; use basename when joining
+            candidate = os.path.join(FLAGS.local_videos_dir, os.path.basename(video_path))
+            if os.path.exists(candidate):
+                logging.info(f"Using local video for {clip_id}: {candidate}")
+                temp_video = candidate
+                delete_temp = False
+                
+                # If local videos are already 10s clips, extract from 0-10 instead of CSV start/end
+                if FLAGS.local_are_clips:
+                    start_time = 0
+                    end_time = 10
+                    logging.info(f"Local video is pre-clipped, extracting 0-10s instead of {row['start']}-{row['end']}s")
+                
+                # Optionally check duration using ffprobe
+                if FLAGS.check_duration and not FLAGS.local_are_clips:
+                    duration = get_local_video_duration(candidate)
+                    if duration is None:
+                        logging.warning(f"Could not get local duration for {candidate}, attempting processing anyway")
+                    elif start_time + 10 > duration:
+                        logging.warning(f"Local video {candidate} is only {duration:.1f}s long, cannot extract segment at {start_time}s-{start_time+10}s")
+                        return None
+            else:
+                # If require_local is set, skip this video instead of downloading
+                if FLAGS.require_local:
+                    logging.warning(f"Local video not found at {candidate} and --require_local is set, skipping {clip_id}")
+                    return None
+                # Otherwise fall back to download if local file not found
+                logging.info(f"Local video not found at {candidate}, falling back to YouTube download for {video_id}")
+
+        # Download video if we don't already have a local file
+        if delete_temp:
+            if not download_youtube_video(video_id, start_time, temp_video, check_duration=FLAGS.check_duration):
+                return None
+
         # Process video - extract the specific segment with ffmpeg
         sequence_example = gen_module.create_sequence_example(
             video_path=temp_video,
@@ -199,20 +257,20 @@ def process_video_entry(row: dict, temp_dir: str, **kwargs) -> Optional[tf.train
             clip_id=clip_id,
             **kwargs
         )
-        
+
         return sequence_example
-        
+
     except Exception as e:
         logging.error(f"Error processing {clip_id}: {e}")
         return None
-        
+
     finally:
-        # Delete temporary file
-        if os.path.exists(temp_video):
-            try:
+        # Delete temporary file only if we created it in temp_dir
+        try:
+            if delete_temp and os.path.exists(temp_video) and os.path.dirname(temp_video) == os.path.abspath(temp_dir):
                 os.remove(temp_video)
-            except:
-                pass
+        except Exception:
+            pass
 
 
 def main(argv):
