@@ -91,13 +91,17 @@ while true; do
     
     # Check for completed batches and start downloads
     for BATCH_ID in "${ALL_BATCHES[@]}"; do
-        if [ "${BATCH_STATUS[$BATCH_ID]}" = "submitted" ]; then
+        if [ "${BATCH_STATUS[$BATCH_ID]}" = "submitted" ] || [ "${BATCH_STATUS[$BATCH_ID]}" = "completed" ]; then
             # Check if archive exists (job completed)
             if ssh bravhee@mentat001.dccn.nl "test -f ~/scenic_PhD/PreProcessing/test_batch_${BATCH_ID}.tar.gz" 2>/dev/null; then
-                BATCH_STATUS[$BATCH_ID]="completed"
+                # Only mark as completed if not already downloading
+                if [ "${BATCH_STATUS[$BATCH_ID]}" = "submitted" ]; then
+                    BATCH_STATUS[$BATCH_ID]="completed"
+                fi
                 
-                # Start download in background if not at limit
-                if [ $ACTIVE_DOWNLOADS -lt $PARALLEL_DOWNLOADS ]; then
+                # Start download in background if not already downloading and not at limit
+                if [ "${BATCH_STATUS[$BATCH_ID]}" = "completed" ] && [ $ACTIVE_DOWNLOADS -lt $PARALLEL_DOWNLOADS ]; then
+                    BATCH_STATUS[$BATCH_ID]="downloading"
                     download_batch $BATCH_ID &
                     ACTIVE_DOWNLOADS=$((ACTIVE_DOWNLOADS + 1))
                 fi
@@ -108,8 +112,15 @@ while true; do
         ACTIVE_DOWNLOADS=$(jobs -r | wc -l)
     done
     
-    # Progress update
-    DOWNLOADED=$(printf '%s\n' "${BATCH_STATUS[@]}" | grep -c "downloaded")
+    # Progress update - count actual downloaded files since background jobs can't update the array
+    DOWNLOADED=0
+    for BATCH_ID in "${ALL_BATCHES[@]}"; do
+        if [ -f "$LAPTOP_DIR/test_batch_${BATCH_ID}.tar.gz" ]; then
+            BATCH_STATUS[$BATCH_ID]="downloaded"
+            DOWNLOADED=$((DOWNLOADED + 1))
+        fi
+    done
+    
     TOTAL=${#ALL_BATCHES[@]}
     RUNNING=$(ssh bravhee@mentat001.dccn.nl "squeue -u bravhee -n vggsound_test_micro -h | wc -l" 2>/dev/null || echo "0")
     
@@ -123,8 +134,18 @@ wait
 
 echo ""
 echo "=== TEST Pipeline Complete (OPTIMIZED)! ==="
-DOWNLOADED=$(printf '%s\n' "${BATCH_STATUS[@]}" | grep -c "downloaded")
-FAILED=$(printf '%s\n' "${BATCH_STATUS[@]}" | grep -c "failed")
+
+# Count actual downloaded files
+DOWNLOADED=0
+FAILED=0
+for BATCH_ID in "${ALL_BATCHES[@]}"; do
+    if [ -f "$LAPTOP_DIR/test_batch_${BATCH_ID}.tar.gz" ]; then
+        DOWNLOADED=$((DOWNLOADED + 1))
+    else
+        FAILED=$((FAILED + 1))
+    fi
+done
+
 echo "Downloaded: $DOWNLOADED batches"
 echo "Failed: $FAILED batches"
 echo "Location: $LAPTOP_DIR"
