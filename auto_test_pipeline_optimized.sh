@@ -112,6 +112,20 @@ while true; do
         ACTIVE_DOWNLOADS=$(jobs -r | wc -l)
     done
     
+    # Check for failed batches (jobs completed but no archive) - only after all jobs are done
+    RUNNING=$(ssh bravhee@mentat001.dccn.nl "squeue -u bravhee -n vggsound_test_micro -h | wc -l" 2>/dev/null || echo "0")
+    if [ $RUNNING -eq 0 ]; then
+        for BATCH_ID in "${ALL_BATCHES[@]}"; do
+            if [ "${BATCH_STATUS[$BATCH_ID]}" = "submitted" ]; then
+                # No archive and no jobs running = failed
+                if ! ssh bravhee@mentat001.dccn.nl "test -f ~/scenic_PhD/PreProcessing/test_batch_${BATCH_ID}.tar.gz" 2>/dev/null; then
+                    echo "[$(date +%H:%M:%S)] ✗ Batch $BATCH_ID failed (no archive created)"
+                    BATCH_STATUS[$BATCH_ID]="failed"
+                fi
+            fi
+        done
+    fi
+    
     # Progress update - count actual downloaded files since background jobs can't update the array
     DOWNLOADED=0
     for BATCH_ID in "${ALL_BATCHES[@]}"; do
