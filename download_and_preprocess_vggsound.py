@@ -43,6 +43,8 @@ flags.DEFINE_integer('batch_size', 100, 'Process this many videos before cleanin
 flags.DEFINE_string('progress_file', None, 'File to track progress (auto-generated if not specified).')
 flags.DEFINE_integer('save_progress_every', 50, 'Save progress every N videos.')
 flags.DEFINE_bool('check_duration', True, 'Verify video duration before downloading segment.')
+flags.DEFINE_string('cookies_from_browser', None, 'Browser to extract cookies from (chrome, firefox, edge, etc).')
+flags.DEFINE_string('cookies_file', None, 'Path to cookies.txt file for yt-dlp authentication.')
 
 flags.mark_flag_as_required('csv_path')
 flags.mark_flag_as_required('output_path')
@@ -65,8 +67,15 @@ def get_video_duration(video_id: str) -> Optional[float]:
             '--no-warnings',
             '--print', 'duration',
             '--no-playlist',
-            url
         ]
+        
+        # Add cookie authentication if provided
+        if FLAGS.cookies_from_browser:
+            cmd.extend(['--cookies-from-browser', FLAGS.cookies_from_browser])
+        elif FLAGS.cookies_file:
+            cmd.extend(['--cookies', FLAGS.cookies_file])
+        
+        cmd.append(url)
         
         result = subprocess.run(cmd, capture_output=True, timeout=30, text=True)
         
@@ -116,8 +125,15 @@ def download_youtube_video(video_id: str, start_time: int, output_path: str,
             '--no-playlist',
             '--concurrent-fragments', '4',  # Download fragments in parallel
             '--throttled-rate', '100K',  # Skip if speed drops below 100KB/s
-            url
         ]
+        
+        # Add cookie authentication if provided
+        if FLAGS.cookies_from_browser:
+            cmd.extend(['--cookies-from-browser', FLAGS.cookies_from_browser])
+        elif FLAGS.cookies_file:
+            cmd.extend(['--cookies', FLAGS.cookies_file])
+        
+        cmd.append(url)
         
         result = subprocess.run(cmd, capture_output=True, timeout=60, text=True)
         

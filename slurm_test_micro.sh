@@ -42,13 +42,21 @@ head -n 1 PreProcessing/vggsound_test.csv > /tmp/vggsound_test_batch_${BATCH_ID}
 cat /tmp/vggsound_test_micro_${BATCH_ID}.csv >> /tmp/vggsound_test_batch_${BATCH_ID}.csv
 
 # Process this small batch
+# Use cookies file if it exists, otherwise try browser cookies
+if [ -f "$HOME/scenic_PhD/youtube_cookies.txt" ]; then
+  COOKIE_ARG="--cookies_file=$HOME/scenic_PhD/youtube_cookies.txt"
+else
+  COOKIE_ARG="--cookies_from_browser=chrome"
+fi
+
 python download_and_preprocess_vggsound.py \
   --csv_path=/tmp/vggsound_test_batch_${BATCH_ID}.csv \
   --output_path=$OUTPUT_DIR \
   --num_shards=1 \
   --temp_dir=$TEMP_DIR \
   --check_duration=True \
-  --save_progress_every=10
+  --save_progress_every=10 \
+  $COOKIE_ARG
 
 # Archive immediately
 cd $OUTPUT_DIR
