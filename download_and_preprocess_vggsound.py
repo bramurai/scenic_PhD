@@ -67,6 +67,7 @@ def get_video_duration(video_id: str) -> Optional[float]:
             '--no-warnings',
             '--print', 'duration',
             '--no-playlist',
+            '--sleep-requests', '1',  # Sleep 1 second between requests to avoid rate limiting
         ]
         
         # Add cookie authentication if provided
@@ -125,6 +126,7 @@ def download_youtube_video(video_id: str, start_time: int, output_path: str,
             '--no-playlist',
             '--concurrent-fragments', '4',  # Download fragments in parallel
             '--throttled-rate', '100K',  # Skip if speed drops below 100KB/s
+            '--sleep-requests', '1',  # Sleep 1 second between requests to avoid rate limiting
         ]
         
         # Add cookie authentication if provided
