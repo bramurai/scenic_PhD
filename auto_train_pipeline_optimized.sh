@@ -1,9 +1,9 @@
 #!/bin/bash
-# OPTIMIZED: Download batches immediately as they complete (parallel download) - TRAINING
+# CHUNKED PROCESSING: Process 25 batches at a time, wait for completion, download, repeat - TRAINING
 
 TOTAL_VIDEOS=183971  # Training set size
 BATCH_SIZE=200  # Process 200 videos at a time (~1.1GB each)
-PARALLEL_JOBS=25  # Run 25 jobs simultaneously
+PARALLEL_JOBS=25  # Run 25 jobs simultaneously per chunk
 PARALLEL_DOWNLOADS=25  # Download 25 batches simultaneously (1 Gbps connection can handle it!)
 LAPTOP_DIR="$1"
 
@@ -14,153 +14,133 @@ fi
 
 mkdir -p "$LAPTOP_DIR"
 
-echo "=== VGGSound TRAINING Pipeline (OPTIMIZED) ==="
+# Generate all batch starting points
+ALL_STARTS=($(seq 0 $BATCH_SIZE $((TOTAL_VIDEOS - 1))))
+TOTAL_BATCHES=${#ALL_STARTS[@]}
+
+echo "=== VGGSound TRAINING Pipeline (CHUNKED) ==="
 echo "Total videos: $TOTAL_VIDEOS"
 echo "Batch size: $BATCH_SIZE videos"
-echo "Parallel jobs: $PARALLEL_JOBS"
-echo "Parallel downloads: $PARALLEL_DOWNLOADS"
-echo "Total batches: $((TOTAL_VIDEOS / BATCH_SIZE))"
+echo "Total batches: $TOTAL_BATCHES"
+echo "Processing chunks of: $PARALLEL_JOBS batches"
 echo ""
 
-# Track submitted batches
-declare -A BATCH_STATUS
-declare -a ALL_BATCHES
+# Clean up old runs
+echo "=== Cleaning up old runs on cluster ==="
+ssh -o LogLevel=ERROR bravhee@mentat001.dccn.nl "rm -rf ~/scenic_PhD/PreProcessing/tfrecords_train_micro/* ~/scenic_PhD/PreProcessing/train_batch_*.tar.gz" 2>/dev/null
+echo "✓ Cleanup complete"
+echo ""
 
-# Function to download a batch in background
-download_batch() {
-    local BATCH_ID=$1
-    local ARCHIVE="train_batch_${BATCH_ID}.tar.gz"
-    
-    echo "[$(date +%H:%M:%S)] Downloading $ARCHIVE..."
-    
-    if scp -q bravhee@mentat001.dccn.nl:~/scenic_PhD/PreProcessing/$ARCHIVE "$LAPTOP_DIR/" 2>/dev/null; then
-        echo "[$(date +%H:%M:%S)] ✓ Downloaded: $ARCHIVE"
-        
-        # Delete from cluster
-        ssh bravhee@mentat001.dccn.nl "rm ~/scenic_PhD/PreProcessing/$ARCHIVE; rm -rf ~/scenic_PhD/PreProcessing/tfrecords_train_micro/batch_${BATCH_ID}" 2>/dev/null
-        echo "[$(date +%H:%M:%S)] ✓ Cleaned up cluster: batch_${BATCH_ID}"
-        
-        BATCH_STATUS[$BATCH_ID]="downloaded"
-    else
-        echo "[$(date +%H:%M:%S)] ✗ Download failed: $ARCHIVE"
-        BATCH_STATUS[$BATCH_ID]="failed"
+TOTAL_DOWNLOADED=0
+TOTAL_FAILED=0
+
+TOTAL_DOWNLOADED=0
+TOTAL_FAILED=0
+
+# Process in chunks of PARALLEL_JOBS
+for ((CHUNK_START=0; CHUNK_START<TOTAL_BATCHES; CHUNK_START+=PARALLEL_JOBS)); do
+    CHUNK_END=$((CHUNK_START + PARALLEL_JOBS))
+    if [ $CHUNK_END -gt $TOTAL_BATCHES ]; then
+        CHUNK_END=$TOTAL_BATCHES
     fi
-}
-
-# Submit all batches
-echo "=== Submitting batches ==="
-for START in $(seq 0 $BATCH_SIZE $((TOTAL_VIDEOS - BATCH_SIZE))); do
-    END=$((START + BATCH_SIZE))
-    BATCH_ID=$(printf "%05d" $START)
     
-    # Wait if too many jobs running
-    RUNNING=$(ssh bravhee@mentat001.dccn.nl "squeue -u bravhee -n vggsound_train_micro -h | wc -l")
-    while [ $RUNNING -ge $PARALLEL_JOBS ]; do
-        sleep 10
-        RUNNING=$(ssh bravhee@mentat001.dccn.nl "squeue -u bravhee -n vggsound_train_micro -h | wc -l")
+    CHUNK_NUM=$((CHUNK_START / PARALLEL_JOBS + 1))
+    TOTAL_CHUNKS=$(((TOTAL_BATCHES + PARALLEL_JOBS - 1) / PARALLEL_JOBS))
+    
+    echo "=========================================="
+    echo "=== CHUNK $CHUNK_NUM of $TOTAL_CHUNKS ==="
+    echo "=========================================="
+    echo ""
+    
+    # Arrays for this chunk
+    declare -a CHUNK_BATCH_IDS
+    
+    # Submit batches for this chunk
+    echo "=== Submitting batches $(($CHUNK_START + 1)) to $CHUNK_END ==="
+    for ((i=CHUNK_START; i<CHUNK_END; i++)); do
+        START=${ALL_STARTS[$i]}
+        END=$((START + BATCH_SIZE))
+        BATCH_ID=$(printf "%05d" $START)
+        
+        ssh -o LogLevel=ERROR bravhee@mentat001.dccn.nl "cd scenic_PhD && sbatch slurm_train_micro.sh $START $END" > /dev/null 2>&1
+        CHUNK_BATCH_IDS+=($BATCH_ID)
+        echo "[$(date +%H:%M:%S)] ✓ Submitted batch $BATCH_ID ($START-$END)"
+        sleep 1
     done
     
-    ssh bravhee@mentat001.dccn.nl "cd scenic_PhD && sbatch slurm_train_micro.sh $START $END" > /dev/null 2>&1
-    sleep 1
+    echo ""
+    echo "=== Waiting for chunk to complete ==="
     
-    BATCH_STATUS[$BATCH_ID]="submitted"
-    ALL_BATCHES+=($BATCH_ID)
-    echo "[$(date +%H:%M:%S)] ✓ Submitted batch $BATCH_ID ($START-$END)"
-done
-
-echo ""
-echo "=== All batches submitted. Monitoring completion and downloading ==="
-echo ""
-
-# Monitor and download as batches complete
-ACTIVE_DOWNLOADS=0
-
-while true; do
-    # Check if all batches are downloaded
-    ALL_DONE=true
-    for BATCH_ID in "${ALL_BATCHES[@]}"; do
-        STATUS="${BATCH_STATUS[$BATCH_ID]}"
-        if [ "$STATUS" != "downloaded" ] && [ "$STATUS" != "failed" ]; then
-            ALL_DONE=false
+    # Wait for all jobs in this chunk to complete
+    while true; do
+        RUNNING=$(ssh -o LogLevel=ERROR bravhee@mentat001.dccn.nl "squeue -u bravhee -n vggsound_train_micro -h | wc -l" 2>/dev/null || echo "0")
+        
+        if [ $RUNNING -eq 0 ]; then
+            echo "[$(date +%H:%M:%S)] All jobs completed!"
             break
         fi
-    done
-    
-    if [ "$ALL_DONE" = true ]; then
-        break
-    fi
-    
-    # Check for completed batches and start downloads
-    for BATCH_ID in "${ALL_BATCHES[@]}"; do
-        if [ "${BATCH_STATUS[$BATCH_ID]}" = "submitted" ] || [ "${BATCH_STATUS[$BATCH_ID]}" = "completed" ]; then
-            # Check if archive exists (job completed)
-            if ssh bravhee@mentat001.dccn.nl "test -f ~/scenic_PhD/PreProcessing/train_batch_${BATCH_ID}.tar.gz" 2>/dev/null; then
-                # Only mark as completed if not already downloading
-                if [ "${BATCH_STATUS[$BATCH_ID]}" = "submitted" ]; then
-                    BATCH_STATUS[$BATCH_ID]="completed"
-                fi
-                
-                # Start download in background if not already downloading and not at limit
-                if [ "${BATCH_STATUS[$BATCH_ID]}" = "completed" ] && [ $ACTIVE_DOWNLOADS -lt $PARALLEL_DOWNLOADS ]; then
-                    BATCH_STATUS[$BATCH_ID]="downloading"
-                    download_batch $BATCH_ID &
-                    ACTIVE_DOWNLOADS=$((ACTIVE_DOWNLOADS + 1))
-                fi
-            fi
-        fi
         
-        # Recount active downloads
-        ACTIVE_DOWNLOADS=$(jobs -r | wc -l)
+        echo "[$(date +%H:%M:%S)] Waiting... ($RUNNING jobs still running)"
+        sleep 15
     done
     
-    # Check for failed batches (jobs completed but no archive) - only after all jobs are done
-    RUNNING=$(ssh bravhee@mentat001.dccn.nl "squeue -u bravhee -n vggsound_train_micro -h | wc -l" 2>/dev/null || echo "0")
-    if [ $RUNNING -eq 0 ]; then
-        for BATCH_ID in "${ALL_BATCHES[@]}"; do
-            if [ "${BATCH_STATUS[$BATCH_ID]}" = "submitted" ]; then
-                # No archive and no jobs running = failed
-                if ! ssh bravhee@mentat001.dccn.nl "test -f ~/scenic_PhD/PreProcessing/train_batch_${BATCH_ID}.tar.gz" 2>/dev/null; then
-                    echo "[$(date +%H:%M:%S)] ✗ Batch $BATCH_ID failed (no archive created)"
-                    BATCH_STATUS[$BATCH_ID]="failed"
-                fi
-            fi
-        done
-    fi
+    echo ""
+    echo "=== Downloading completed batches ==="
     
-    # Progress update - count actual downloaded files since background jobs can't update the array
-    DOWNLOADED=0
-    for BATCH_ID in "${ALL_BATCHES[@]}"; do
+    # Download all batches from this chunk in parallel
+    for BATCH_ID in "${CHUNK_BATCH_IDS[@]}"; do
+        (
+            ARCHIVE="train_batch_${BATCH_ID}.tar.gz"
+            
+            if ssh -o LogLevel=ERROR bravhee@mentat001.dccn.nl "test -f ~/scenic_PhD/PreProcessing/$ARCHIVE" 2>/dev/null; then
+                echo "[$(date +%H:%M:%S)] Downloading $ARCHIVE..."
+                
+                if scp -o LogLevel=ERROR -q bravhee@mentat001.dccn.nl:~/scenic_PhD/PreProcessing/$ARCHIVE "$LAPTOP_DIR/" 2>/dev/null; then
+                    echo "[$(date +%H:%M:%S)] ✓ Downloaded: $ARCHIVE"
+                    
+                    # Delete from cluster
+                    ssh -o LogLevel=ERROR bravhee@mentat001.dccn.nl "rm ~/scenic_PhD/PreProcessing/$ARCHIVE; rm -rf ~/scenic_PhD/PreProcessing/tfrecords_train_micro/batch_${BATCH_ID}" 2>/dev/null
+                    echo "[$(date +%H:%M:%S)] ✓ Cleaned up cluster: batch_${BATCH_ID}"
+                else
+                    echo "[$(date +%H:%M:%S)] ✗ Download failed: $ARCHIVE"
+                fi
+            else
+                echo "[$(date +%H:%M:%S)] ✗ Batch $BATCH_ID failed (no archive created)"
+            fi
+        ) &
+    done
+    
+    # Wait for all downloads to complete
+    wait
+    
+    # Count successes/failures for this chunk
+    CHUNK_DOWNLOADED=0
+    CHUNK_FAILED=0
+    for BATCH_ID in "${CHUNK_BATCH_IDS[@]}"; do
         if [ -f "$LAPTOP_DIR/train_batch_${BATCH_ID}.tar.gz" ]; then
-            BATCH_STATUS[$BATCH_ID]="downloaded"
-            DOWNLOADED=$((DOWNLOADED + 1))
+            CHUNK_DOWNLOADED=$((CHUNK_DOWNLOADED + 1))
+        else
+            CHUNK_FAILED=$((CHUNK_FAILED + 1))
         fi
     done
     
-    TOTAL=${#ALL_BATCHES[@]}
-    RUNNING=$(ssh bravhee@mentat001.dccn.nl "squeue -u bravhee -n vggsound_train_micro -h | wc -l" 2>/dev/null || echo "0")
+    TOTAL_DOWNLOADED=$((TOTAL_DOWNLOADED + CHUNK_DOWNLOADED))
+    TOTAL_FAILED=$((TOTAL_FAILED + CHUNK_FAILED))
     
-    echo "[$(date +%H:%M:%S)] Progress: $DOWNLOADED/$TOTAL downloaded, $RUNNING jobs running, $ACTIVE_DOWNLOADS downloads active"
+    echo ""
+    echo "=== Chunk $CHUNK_NUM Complete ==="
+    echo "Downloaded: $CHUNK_DOWNLOADED batches"
+    echo "Failed: $CHUNK_FAILED batches"
+    echo "Total progress: $TOTAL_DOWNLOADED/$TOTAL_BATCHES downloaded"
+    echo ""
     
-    sleep 15
+    unset CHUNK_BATCH_IDS
 done
-
-# Wait for remaining downloads
-wait
 
 echo ""
-echo "=== TRAINING Pipeline Complete (OPTIMIZED)! ==="
-
-# Count actual downloaded files
-DOWNLOADED=0
-FAILED=0
-for BATCH_ID in "${ALL_BATCHES[@]}"; do
-    if [ -f "$LAPTOP_DIR/train_batch_${BATCH_ID}.tar.gz" ]; then
-        DOWNLOADED=$((DOWNLOADED + 1))
-    else
-        FAILED=$((FAILED + 1))
-    fi
-done
-
-echo "Downloaded: $DOWNLOADED batches"
-echo "Failed: $FAILED batches"
+echo "=========================================="
+echo "=== TRAINING Pipeline Complete! ==="
+echo "=========================================="
+echo "Total downloaded: $TOTAL_DOWNLOADED batches"
+echo "Total failed: $TOTAL_FAILED batches"
 echo "Location: $LAPTOP_DIR"
