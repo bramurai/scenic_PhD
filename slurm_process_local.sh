@@ -20,7 +20,7 @@ source activate scenic_preprocessing
 
 export KMP_DUPLICATE_LIB_OK=TRUE
 
-LOCAL_VIDEOS_DIR="$HOME/scenic_PhD/vggsound_data/videos"
+LOCAL_VIDEOS_DIR="$HOME/scenic_PhD/vggsound_data/video"
 OUTPUT_DIR="$HOME/scenic_PhD/PreProcessing/tfrecords_${SPLIT}_local/batch_${BATCH_ID}"
 TEMP_DIR="$HOME/scenic_PhD/PreProcessing/temp_${SPLIT}_local"
 
@@ -38,19 +38,16 @@ cd $HOME/scenic_PhD
 
 # Select CSV based on split
 if [ "$SPLIT" == "train" ]; then
-    CSV_FILE="PreProcessing/vggsound_train.csv"
+    CSV_FILE="Video_csvs/vggsound_train.csv"
 else
-    CSV_FILE="PreProcessing/vggsound_test.csv"
+    CSV_FILE="Video_csvs/vggsound_test.csv"
 fi
 
 # Create a temporary CSV with just these rows
 # Row numbers are 0-indexed (row 0 is first data row after header)
-HEADER_OFFSET=1
-head -n $((END_ROW + HEADER_OFFSET + 1)) $CSV_FILE | tail -n $((END_ROW - START_ROW)) > /tmp/vggsound_${SPLIT}_batch_${BATCH_ID}_data.csv
-
-# Add header
+# We need to skip the header (line 1), then get START_ROW to END_ROW
 head -n 1 $CSV_FILE > /tmp/vggsound_${SPLIT}_batch_${BATCH_ID}.csv
-cat /tmp/vggsound_${SPLIT}_batch_${BATCH_ID}_data.csv >> /tmp/vggsound_${SPLIT}_batch_${BATCH_ID}.csv
+tail -n +2 $CSV_FILE | head -n $END_ROW | tail -n $((END_ROW - START_ROW)) >> /tmp/vggsound_${SPLIT}_batch_${BATCH_ID}.csv
 
 echo "Processing $(wc -l < /tmp/vggsound_${SPLIT}_batch_${BATCH_ID}.csv) rows (including header)"
 

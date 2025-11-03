@@ -18,17 +18,22 @@ CLUSTER_PATH="scenic_PhD"
 SPLIT=${1:-train}  # train or test
 START_TAR=${2:-0}  # Which tar file to start from (0-19)
 
-# Get total videos for the split
+# Get total videos for the split by counting actual CSV lines (minus header)
 if [ "$SPLIT" == "train" ]; then
-    TOTAL_VIDEOS=170752  # Training videos
     CSV_NAME="vggsound_train.csv"
 else
-    TOTAL_VIDEOS=15122   # Test videos
     CSV_NAME="vggsound_test.csv"
 fi
 
+# Count actual lines in CSV (total lines - 1 header line)
+CSV_PATH="Video_csvs/${CSV_NAME}"
+TOTAL_VIDEOS=$(ssh -o LogLevel=ERROR ${CLUSTER_USER}@${CLUSTER_HOST} \
+    "tail -n +2 ${CLUSTER_PATH}/${CSV_PATH} | wc -l")
+
+echo "Counted $TOTAL_VIDEOS videos in $CSV_NAME"
+
 BATCH_SIZE=200
-PARALLEL_JOBS=3  # Process 3 batches in parallel per tar file
+PARALLEL_JOBS=30  # Process 30 batches in parallel per tar file (6000 videos at once)
 NUM_TARS=20      # Total number of tar files
 
 echo "============================================"
@@ -43,6 +48,23 @@ echo ""
 
 # Create local output directory
 mkdir -p "${SPLIT}_tfrecords_local"
+
+# Initial cleanup of cluster storage before starting
+echo "=== INITIAL CLEANUP: Cleaning cluster storage ==="
+ssh -o LogLevel=ERROR ${CLUSTER_USER}@${CLUSTER_HOST} << EOF
+    cd ${CLUSTER_PATH}
+    
+    echo "Deleting any existing extracted videos, TFRecords, and progress files..."
+    rm -rf vggsound_data/video
+    rm -f vggsound_data/*.tar.gz
+    rm -f PreProcessing/tfrecords_${SPLIT}_local/batch_*/*.tfrecord
+    rm -f PreProcessing/tfrecords_${SPLIT}_local/batch_*/.progress.json
+    rm -f PreProcessing/${SPLIT}_batch_*.tar.gz
+    
+    echo "Cluster storage before starting:"
+    df -h ~ | tail -1
+EOF
+echo ""
 
 # Process each tar file one by one
 for ((tar_id=START_TAR; tar_id<NUM_TARS; tar_id++)); do
@@ -88,16 +110,18 @@ EOF
         cd ${CLUSTER_PATH}/vggsound_data
         
         echo "Extracting ${TAR_FILE}..."
-        mkdir -p videos
-        tar -xzf "${TAR_FILE}" -C videos --strip-components=6 || exit 1
+        tar -xzf "${TAR_FILE}" --strip-components=6 || exit 1
         echo "Extraction complete!"
         
-        echo "Extracted videos:"
-        ls videos | head -20
-        echo "Total videos in this tar:"
-        ls videos | wc -l
+        echo "Deleting tar file to save space..."
+        rm -f "${TAR_FILE}"
         
-        echo "Cluster storage after extraction:"
+        echo "Extracted videos:"
+        ls video/*.mp4 2>/dev/null | head -20
+        echo "Total videos in this tar:"
+        ls video/*.mp4 2>/dev/null | wc -l
+        
+        echo "Cluster storage after extraction and tar deletion:"
         df -h ~ | tail -1
 EOF
     
@@ -113,7 +137,7 @@ EOF
     
     # Get list of video files in this tar
     VIDEO_LIST=$(ssh -o LogLevel=ERROR ${CLUSTER_USER}@${CLUSTER_HOST} \
-        "ls ${CLUSTER_PATH}/vggsound_data/videos/*.mp4 2>/dev/null | xargs -n1 basename" | tr '\n' '|' | sed 's/|$//')
+        "cd ${CLUSTER_PATH}/vggsound_data && ls video/*.mp4 2>/dev/null | xargs -n1 basename" | tr '\n' '|' | sed 's/|$//')
     
     if [ -z "$VIDEO_LIST" ]; then
         echo "WARNING: No videos found in tar $tar_id, skipping..."
@@ -164,6 +188,7 @@ EOF
         # Wait for these jobs to complete
         if [ ${#job_ids[@]} -gt 0 ]; then
             echo "Waiting for ${#job_ids[@]} jobs to complete..."
+            sleep 10
             while true; do
                 job_count=$(ssh -o LogLevel=ERROR ${CLUSTER_USER}@${CLUSTER_HOST} \
                     "squeue -u ${CLUSTER_USER} -n vgg_process_local -h | wc -l")
@@ -177,8 +202,9 @@ EOF
                 sleep 30
             done
             
-            # Download TFRecord archives that were created
+            # Download TFRecord archives that were created (in parallel for speed)
             echo "Downloading TFRecord archives..."
+            download_pids=()
             for ((i=0; i<PARALLEL_JOBS; i++)); do
                 current_batch=$((batch + i))
                 if [ $current_batch -ge $TOTAL_BATCHES ]; then
@@ -188,15 +214,28 @@ EOF
                 start_row=$((current_batch * BATCH_SIZE))
                 batch_id=$(printf "%05d" $start_row)
                 archive="${SPLIT}_batch_${batch_id}.tar.gz"
+                local_archive="${SPLIT}_tar${TAR_NUM}_batch_${batch_id}.tar.gz"
                 
-                # Try to download (may not exist if no videos from this tar were in the batch)
-                scp -o LogLevel=ERROR \
-                    ${CLUSTER_USER}@${CLUSTER_HOST}:${CLUSTER_PATH}/PreProcessing/${archive} \
-                    ${SPLIT}_tfrecords_local/ 2>/dev/null && echo "  Downloaded $archive" || echo "  (no archive for batch $current_batch)"
-                
-                # Delete remote archive
-                ssh -o LogLevel=ERROR ${CLUSTER_USER}@${CLUSTER_HOST} \
-                    "rm -f ${CLUSTER_PATH}/PreProcessing/${archive}" 2>/dev/null || true
+                # Download in background for parallel transfer
+                (
+                    if scp -C -o CompressionLevel=6 -o LogLevel=ERROR \
+                        ${CLUSTER_USER}@${CLUSTER_HOST}:${CLUSTER_PATH}/PreProcessing/${archive} \
+                        ${SPLIT}_tfrecords_local/${local_archive} 2>/dev/null; then
+                        echo "  Downloaded ${local_archive}"
+                    else
+                        echo "  (no archive for batch $current_batch)"
+                    fi
+                    
+                    # Delete remote archive
+                    ssh -o LogLevel=ERROR ${CLUSTER_USER}@${CLUSTER_HOST} \
+                        "rm -f ${CLUSTER_PATH}/PreProcessing/${archive}" 2>/dev/null || true
+                ) &
+                download_pids+=($!)
+            done
+            
+            # Wait for all downloads to complete
+            for pid in "${download_pids[@]}"; do
+                wait $pid 2>/dev/null || true
             done
         fi
     done
@@ -207,10 +246,10 @@ EOF
     ssh -o LogLevel=ERROR ${CLUSTER_USER}@${CLUSTER_HOST} << EOF
         cd ${CLUSTER_PATH}
         
-        echo "Deleting tar file and extracted videos..."
-        rm -f vggsound_data/${TAR_FILE}
-        rm -rf vggsound_data/videos/*
+        echo "Deleting extracted videos, TFRecords, and progress files..."
+        rm -rf vggsound_data/video
         rm -f PreProcessing/tfrecords_${SPLIT}_local/batch_*/*.tfrecord
+        rm -f PreProcessing/tfrecords_${SPLIT}_local/batch_*/.progress.json
         
         echo "Cluster storage after cleanup:"
         df -h ~ | tail -1
