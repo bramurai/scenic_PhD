@@ -32,8 +32,8 @@ TOTAL_VIDEOS=$(ssh -o LogLevel=ERROR ${CLUSTER_USER}@${CLUSTER_HOST} \
 
 echo "Counted $TOTAL_VIDEOS videos in $CSV_NAME"
 
-BATCH_SIZE=200
-PARALLEL_JOBS=30  # Process 30 batches in parallel per tar file (6000 videos at once)
+BATCH_SIZE=50
+PARALLEL_JOBS=30  # Process 30 batches in parallel per tar file (1500 videos at once)
 NUM_TARS=20      # Total number of tar files
 
 echo "============================================"
@@ -77,8 +77,9 @@ for ((tar_id=START_TAR; tar_id<NUM_TARS; tar_id++)); do
     echo "Processing TAR $tar_id/$((NUM_TARS-1)): $TAR_FILE"
     echo "========================================"
     
-    # Step 1: Download tar file on cluster
+    # Step 1: Download tar file on cluster (with partial extraction support)
     echo "=== STEP 1: Downloading tar file on cluster ==="
+    
     ssh -o LogLevel=ERROR ${CLUSTER_USER}@${CLUSTER_HOST} << EOF
         cd ${CLUSTER_PATH}
         mkdir -p vggsound_data
@@ -88,14 +89,20 @@ for ((tar_id=START_TAR; tar_id<NUM_TARS; tar_id++)); do
         df -h ~ | tail -1
         
         if [ -f "${TAR_FILE}" ]; then
-            echo "Tar file already exists, skipping download"
+            echo "Tar file already exists, checking integrity..."
+            if gzip -t "${TAR_FILE}" 2>/dev/null; then
+                echo "✓ Tar file integrity verified!"
+            else
+                echo "⚠ Tar file partially corrupted, but will attempt extraction"
+            fi
+            ls -lh "${TAR_FILE}"
         else
             echo "Downloading ${TAR_FILE} (~17GB, ~30-60 min)..."
             wget -c "${BASE_URL}/${TAR_FILE}" -O "${TAR_FILE}" || exit 1
             echo "Download complete!"
-        fi
         
-        ls -lh "${TAR_FILE}"
+            ls -lh "${TAR_FILE}"
+        fi
 EOF
     
     if [ $? -ne 0 ]; then
@@ -103,31 +110,47 @@ EOF
         exit 1
     fi
     
-    # Step 2: Extract tar file
+    # Step 2: Extract tar file (with partial extraction support)
     echo ""
-    echo "=== STEP 2: Extracting tar file ==="
+    echo "=== STEP 2: Extracting tar file (tolerating partial corruption) ==="
+    
     ssh -o LogLevel=ERROR ${CLUSTER_USER}@${CLUSTER_HOST} << EOF
         cd ${CLUSTER_PATH}/vggsound_data
         
         echo "Extracting ${TAR_FILE}..."
-        tar -xzf "${TAR_FILE}" --strip-components=6 || exit 1
-        echo "Extraction complete!"
+        echo "(Note: Extraction may show errors at end if file is partially corrupted)"
+        
+        # Use tar with --ignore-command-error to extract as much as possible
+        # Redirect stderr to capture errors but continue
+        tar -xzf "${TAR_FILE}" --strip-components=6 --ignore-command-error 2>&1 | tail -20 || true
+        
+        echo ""
+        echo "Extraction attempt finished (some errors may have occurred)"
         
         echo "Deleting tar file to save space..."
         rm -f "${TAR_FILE}"
         
         echo "Extracted videos:"
         ls video/*.mp4 2>/dev/null | head -20
-        echo "Total videos in this tar:"
-        ls video/*.mp4 2>/dev/null | wc -l
+        echo "Total videos extracted:"
+        video_count=\$(ls video/*.mp4 2>/dev/null | wc -l)
+        echo "\$video_count"
         
-        echo "Cluster storage after extraction and tar deletion:"
-        df -h ~ | tail -1
+        if [ "\$video_count" -gt 0 ]; then
+            echo "✓ Successfully extracted \$video_count videos (partial extraction OK)"
+            echo "Cluster storage after extraction and tar deletion:"
+            df -h ~ | tail -1
+            exit 0
+        else
+            echo "✗ No videos extracted - tar file completely unusable"
+            exit 1
+        fi
 EOF
     
     if [ $? -ne 0 ]; then
-        echo "ERROR: Failed to extract tar file!"
-        exit 1
+        echo "ERROR: No videos could be extracted from tar file!"
+        echo "Skipping tar $tar_id and moving to next..."
+        continue
     fi
     
     # Step 3: Calculate which batches use videos from this tar
