@@ -33,7 +33,7 @@ TOTAL_VIDEOS=$(ssh -o LogLevel=ERROR ${CLUSTER_USER}@${CLUSTER_HOST} \
 echo "Counted $TOTAL_VIDEOS videos in $CSV_NAME"
 
 BATCH_SIZE=50
-PARALLEL_JOBS=30  # Process 30 batches in parallel per tar file (1500 videos at once)
+PARALLEL_JOBS=10  # Process 10 batches in parallel per tar file (500 videos at once)
 NUM_TARS=20      # Total number of tar files
 
 echo "============================================"
