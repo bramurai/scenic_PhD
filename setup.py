@@ -79,8 +79,10 @@ install_requires_core = [
     "ml-collections>=0.1.1",
     "tensorflow>=2.7,<2.12",
     "tensorflow-addons>=0.19.0",
+    "scikit-learn==1.2.2",
     "immutabledict>=2.2.1",
     "clu>=0.0.6,<=0.0.9",
+    "seaborn>=0.11.2",
     "tensorflow-datasets>=4.0.0,<4.9.0",
     "optax==0.1.5",
 ]

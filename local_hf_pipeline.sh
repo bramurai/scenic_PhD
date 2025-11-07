@@ -119,68 +119,78 @@ for ((tar_id=START_TAR; tar_id<NUM_TARS; tar_id++)); do
     echo "Processing TAR $tar_id/$((NUM_TARS-1)): $TAR_FILE"
     echo "========================================"
     
-    # Step 1: Download tar file
-    echo "=== STEP 1: Downloading tar file from HuggingFace ==="
-    
-    if [ -f "$TAR_PATH" ]; then
-        echo "Tar file already exists, checking integrity..."
-        if gzip -t "$TAR_PATH" 2>/dev/null; then
-            echo "✓ Tar file integrity verified!"
-        else
-            echo "⚠ Tar file corrupted, re-downloading..."
-            rm -f "$TAR_PATH"
-            rm -f "${TAR_PATH}.aria2"  # Remove aria2 control file
-        fi
-    fi
-    
-    if [ ! -f "$TAR_PATH" ]; then
-        echo "Downloading ${TAR_FILE} (~17GB, this may take 10-30 minutes)..."
-        aria2c \
-            --max-connection-per-server=16 \
-            --split=16 \
-            --min-split-size=1M \
-            --max-tries=5 \
-            --retry-wait=5 \
-            --continue=true \
-            --console-log-level=notice \
-            --summary-interval=10 \
-            "${BASE_URL}/${TAR_FILE}" \
-            --dir="$(dirname "$TAR_PATH")" \
-            --out="$(basename "$TAR_PATH")" || {
-            echo "ERROR: Download failed!"
-            exit 1
-        }
-        echo "✓ Download complete!"
-    fi
-    
-    ls -lh "$TAR_PATH"
-    echo ""
-    
-    # Step 2: Extract videos
-    echo "=== STEP 2: Extracting videos ==="
-    
     VIDEO_DIR="${TEMP_DIR}/videos_${TAR_NUM}"
-    mkdir -p "$VIDEO_DIR"
     
-    echo "Extracting to: $VIDEO_DIR"
-    tar -xzf "$TAR_PATH" -C "$VIDEO_DIR" --strip-components=7 2>&1 | tail -20 || true
-    
-    # Count extracted videos
+    # Check if videos are already extracted
     VIDEO_COUNT=$(find "$VIDEO_DIR" -name "*.mp4" 2>/dev/null | wc -l)
     
-    if [ "$VIDEO_COUNT" -eq 0 ]; then
-        echo "ERROR: No videos extracted!"
-        rm -rf "$VIDEO_DIR"
+    if [ "$VIDEO_COUNT" -gt 0 ]; then
+        echo "✓ Found $VIDEO_COUNT videos already extracted in $VIDEO_DIR"
+        echo "Skipping download and extraction steps."
+        echo ""
+    else
+        # Step 1: Download tar file
+        echo "=== STEP 1: Downloading tar file from HuggingFace ==="
+        
+        if [ -f "$TAR_PATH" ]; then
+            echo "Tar file already exists, checking integrity..."
+            if gzip -t "$TAR_PATH" 2>/dev/null; then
+                echo "✓ Tar file integrity verified!"
+            else
+                echo "⚠ Tar file corrupted, re-downloading..."
+                rm -f "$TAR_PATH"
+                rm -f "${TAR_PATH}.aria2"  # Remove aria2 control file
+            fi
+        fi
+        
+        if [ ! -f "$TAR_PATH" ]; then
+            echo "Downloading ${TAR_FILE} (~17GB, this may take 10-30 minutes)..."
+            aria2c \
+                --max-connection-per-server=16 \
+                --split=16 \
+                --min-split-size=1M \
+                --max-tries=5 \
+                --retry-wait=5 \
+                --continue=true \
+                --console-log-level=notice \
+                --summary-interval=10 \
+                "${BASE_URL}/${TAR_FILE}" \
+                --dir="$(dirname "$TAR_PATH")" \
+                --out="$(basename "$TAR_PATH")" || {
+                echo "ERROR: Download failed!"
+                exit 1
+            }
+            echo "✓ Download complete!"
+        fi
+        
+        ls -lh "$TAR_PATH"
+        echo ""
+        
+        # Step 2: Extract videos
+        echo "=== STEP 2: Extracting videos ==="
+        
+        mkdir -p "$VIDEO_DIR"
+        
+        echo "Extracting to: $VIDEO_DIR"
+        tar -xzf "$TAR_PATH" -C "$VIDEO_DIR" --strip-components=7 2>&1 | tail -20 || true
+        
+        # Count extracted videos
+        VIDEO_COUNT=$(find "$VIDEO_DIR" -name "*.mp4" 2>/dev/null | wc -l)
+        
+        echo "✓ Extracted $VIDEO_COUNT videos"
+        
+        # Delete tar to save space
+        echo "Deleting tar file to save space..."
         rm -f "$TAR_PATH"
-        continue
+        echo ""
     fi
     
-    echo "✓ Extracted $VIDEO_COUNT videos"
-    
-    # Delete tar to save space
-    echo "Deleting tar file to save space..."
-    rm -f "$TAR_PATH"
-    echo ""
+    # Final check: ensure we have videos to process
+    if [ "$VIDEO_COUNT" -eq 0 ]; then
+        echo "ERROR: No videos found in $VIDEO_DIR!"
+        rm -rf "$VIDEO_DIR"
+        continue
+    fi
     
     # Step 3: Process videos into TFRecords
     echo "=== STEP 3: Processing videos into TFRecords ==="

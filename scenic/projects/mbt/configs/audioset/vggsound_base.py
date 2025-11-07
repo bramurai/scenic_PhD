@@ -38,7 +38,7 @@ def get_config():
   
   # OPTION 1: If you keep the batch_* directory structure
   # Point base_dir to the parent directory containing train_tfrecords_local and test_tfrecords_local
-  config.dataset_configs.base_dir = '/path/to/scenic_PhD/scenic_PhD'  # UPDATE THIS!
+  config.dataset_configs.base_dir = '/home/labuta/Documents/Bram/scenic_PhD'  # UPDATE THIS!
   config.dataset_configs.tables = {
       # Glob pattern matches all TFRecord shards in all batch directories
       'train': 'train_tfrecords_local/batch_*/data-*-of-*.tfrecord',
