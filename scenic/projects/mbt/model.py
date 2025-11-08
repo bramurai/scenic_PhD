@@ -713,6 +713,9 @@ class MBTClassificationModel(ClassificationModel):
             label_smoothing=self.config.get('label_smoothing')))
       sof_ce_loss = jnp.mean(jnp.array(sof_ce_loss))
     else:
+      if isinstance(labels, dict):
+        assert 'all' in labels, 'mixmod must be turned off.'
+        labels = labels['all']
       sof_ce_loss = base_model_utils.weighted_softmax_cross_entropy(
           logits,
           labels,

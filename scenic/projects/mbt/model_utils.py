@@ -117,10 +117,18 @@ def initialise_from_train_state(
   params = flax.core.unfreeze(train_state.params)
   logging.info('Parameters in the target model are: %s', params)
 
+  # Extract params from restored checkpoint (handles both old and new formats)
   if init_config.get('checkpoint_format', 'scenic') == 'big_vision':
+    # Big vision format always has optimizer['target']
     restored_params = restored_train_state.optimizer['target']
   else:
-    restored_params = restored_train_state.params
+    # Scenic format: check if it's new optax-based (has 'params') or old flax.optim-based (has 'optimizer')
+    if hasattr(restored_train_state, 'params') and restored_train_state.params is not None:
+      restored_params = restored_train_state.params
+    elif hasattr(restored_train_state, 'optimizer'):
+      restored_params = restored_train_state.optimizer['target']
+    else:
+      raise ValueError('Could not find params in restored_train_state')
   restored_params = flax.core.unfreeze(restored_params)
 
   if init_config.get('init_from_vit', True):
@@ -208,8 +216,8 @@ def initialise_from_train_state(
   if log_initialised_param_shapes:
     logging.info('Parameter summary after initialising from train state')
     log_param_shapes(params) #debug_utils.log_param_shapes(params)
-  return train_state.replace(
-      optimizer=train_state.optimizer.replace(target=flax.core.freeze(params)))
+  # Update train_state with the new params (for new optax-based TrainState)
+  return train_state.replace(params=flax.core.freeze(params))
 
 
 def init_posemb(to_params, from_params, init_config, model_config,

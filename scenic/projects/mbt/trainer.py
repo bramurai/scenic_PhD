@@ -21,6 +21,7 @@ from typing import Any, Callable, Dict, Optional, Tuple, Union
 from absl import logging
 from clu import metric_writers
 from clu import periodic_actions
+from clu import platform
 from flax import jax_utils
 import flax.linen as nn
 import jax
@@ -247,6 +248,10 @@ def train_step(
     batch['label'] = batch['label'][modality]
     metrics = metrics_fn(logits[modality], batch)
   else:
+    # When logits is not a dict but labels were converted to dict,
+    # extract the 'all' label which has all modalities' labels
+    if isinstance(batch['label'], dict):
+      batch['label'] = batch['label']['all']
     metrics = metrics_fn(logits, batch)
   new_train_state = train_state.replace(
       global_step=step + 1,
@@ -307,6 +312,11 @@ def eval_step(
       batch['inputs'],
       train=False, mutable=False, debug=debug)
 
+  # When logits is not a dict but labels were converted to dict,
+  # extract the 'all' label which has all modalities' labels
+  if not isinstance(logits, dict) and isinstance(batch['label'], dict):
+    batch['label'] = batch['label']['all']
+  
   metrics = metrics_fn(logits, batch)
   if return_logits_and_labels:
     logits = jax.lax.all_gather(logits, 'batch')
@@ -362,6 +372,9 @@ def test_step(
     Calculated metrics [and optionally averaged logits that are of
     shape `[1, num_classes]`].
   """
+  # Handle dict labels - extract the 'all' label if labels is a dict
+  if isinstance(batch['label'], dict):
+    batch['label'] = batch['label']['all']
 
   all_logits = jnp.zeros(batch['label'].shape[1])
   assert len(batch['batch_mask'].shape) == 1, (
@@ -450,24 +463,30 @@ def train(
        config=config,
        rngs=init_rng)
 
+  # Get learning rate scheduler.
+  learning_rate_fn = lr_schedules.get_learning_rate_fn(config)
+
   # Create optimizer using Optax (train_lib).
-  optimizer = optimizers.get_optimizer(config, learning_rate_fn, params)
+  optimizer_config = optimizers.get_optax_optimizer_config(config)
+  optimizer = optimizers.get_optimizer(optimizer_config, learning_rate_fn, params)
   opt_state = optimizer.init(params)
   rng, train_rng = jax.random.split(rng)
   train_state = train_utils.TrainState(
-    global_step=0,
-    params=params,
-    opt_state=opt_state,
-    model_state=model_state,
-    rng=train_rng,
-    accum_train_time=0)
+      global_step=0,
+      tx=optimizer,
+      params=params,
+      opt_state=opt_state,
+      model_state=model_state,
+      rng=train_rng,
+      metadata={'accum_train_time': 0})
   start_step = train_state.global_step
   if config.checkpoint:
     train_state, start_step = train_utils.restore_checkpoint(
         workdir, train_state)
 
   if (start_step == 0  # Which means "no" checkpoint is restored!
-      and config.get('init_from') is not None):
+      and config.get('init_from') is not None
+      and config.init_from.get('checkpoint_path') is not None):
     restored_model_cfg = config.init_from.get('model_config')
     init_checkpoint_path = config.init_from.get('checkpoint_path')
     checkpoint_format = config.init_from.get('checkpoint_format', 'scenic')
@@ -502,8 +521,6 @@ def train(
   # Calculate the total number of training steps.
   total_steps, steps_per_epoch = train_utils.get_num_training_steps(
       config, dataset.meta_data)
-  # Get learning rate scheduler.
-  learning_rate_fn = lr_schedules.get_learning_rate_fn(config)
 
   train_step_pmapped = jax.pmap(
     functools.partial(
@@ -574,16 +591,22 @@ def train(
   train_metrics, extra_training_logs = [], []
   train_summary, eval_summary = None, None
 
-  chrono = train_utils.Chrono(
+  chrono = train_utils.Chrono()
+  chrono.load({'accum_train_time': int(jax_utils.unreplicate(train_state.metadata.get('accum_train_time', 0)))})
+  chrono.inform(
       first_step=start_step,
       total_steps=total_steps,
       steps_per_epoch=steps_per_epoch,
-      global_bs=config.batch_size,
-      accum_train_time=int(jax_utils.unreplicate(train_state.accum_train_time)))
+      global_bs=config.batch_size)
 
   logging.info('Starting training loop at step %d.', start_step + 1)
   report_progress = periodic_actions.ReportProgress(
       num_train_steps=total_steps, writer=writer)
+  
+  def write_note(note):
+    if lead_host:
+      platform.work_unit().set_notes(note)
+  
   hooks = []
   if lead_host:
     hooks.append(report_progress)
@@ -618,7 +641,7 @@ def train(
     ###################### LOG TRAIN SUMMARY ########################
     if (step % log_summary_steps == 1) or (step == total_steps):
       if lead_host:
-        chrono.tick(step, writer=writer)
+        chrono.tick(step, writer=writer, write_note=write_note)
       train_summary = train_utils.log_train_summary(
           step=step,
           train_metrics=jax.tree_util.tree_map(train_utils.unreplicate_and_get,
@@ -671,8 +694,10 @@ def train(
         # Sync model state across replicas.
         train_state = train_utils.sync_model_state_across_replicas(train_state)
         if lead_host:
-          train_state.replace(  # pytype: disable=attribute-error
-              accum_train_time=chrono.accum_train_time)
+          # Update accum_train_time in metadata before checkpointing
+          updated_metadata = train_state.metadata.copy() if train_state.metadata else {}
+          updated_metadata['accum_train_time'] = chrono.accum_train_time
+          train_state = train_state.replace(metadata=updated_metadata)
           train_utils.save_checkpoint(workdir, train_state)
 
     ############# MULTICROP TESTING ############################

@@ -20,7 +20,9 @@ This config uses TFRecords preprocessed from VGGSound videos.
 """
 # pylint: disable=line-too-long
 
+import glob
 import ml_collections
+import os
 
 # VGGSound dataset sizes (update based on your actual preprocessed data)
 VGGSOUND_TRAIN_SIZE = 183971  # Actual count from your train CSV
@@ -36,24 +38,25 @@ def get_config():
   # Dataset - UPDATE THESE PATHS TO YOUR EXTRACTED TFRECORDS
   config.dataset_configs = ml_collections.ConfigDict()
   
-  # OPTION 1: If you keep the batch_* directory structure
   # Point base_dir to the parent directory containing train_tfrecords_local and test_tfrecords_local
-  config.dataset_configs.base_dir = '/home/labuta/Documents/Bram/scenic_PhD'  # UPDATE THIS!
-  config.dataset_configs.tables = {
-      # Glob pattern matches all TFRecord shards in all batch directories
-      'train': 'train_tfrecords_local/batch_*/data-*-of-*.tfrecord',
-      'validation': 'test_tfrecords_local/batch_*/data-*-of-*.tfrecord',
-      'test': 'test_tfrecords_local/batch_*/data-*-of-*.tfrecord',
-  }
+  config.dataset_configs.base_dir = '/home/labuta/Documents/Bram/scenic_PhD'
   
-  # OPTION 2: If you flatten the structure (after extracting all archives)
-  # Uncomment and modify these lines instead:
-  # config.dataset_configs.base_dir = '/path/to/vggsound_tfrecords'  # UPDATE THIS!
-  # config.dataset_configs.tables = {
-  #     'train': 'train/data-*-of-*.tfrecord',  # All train TFRecords
-  #     'validation': 'test/data-*-of-*.tfrecord',  # All test TFRecords
-  #     'test': 'test/data-*-of-*.tfrecord',
-  # }
+  # Expand glob patterns to get actual file lists
+  train_pattern = os.path.join(config.dataset_configs.base_dir, 'train_tfrecords_local/tar*_batch*/data-*-of-*.tfrecord')
+  test_pattern = os.path.join(config.dataset_configs.base_dir, 'test_tfrecords_local/tar*_batch*/data-*-of-*.tfrecord')
+  
+  train_files = sorted(glob.glob(train_pattern))
+  test_files = sorted(glob.glob(test_pattern))
+  
+  # Convert to relative paths from base_dir
+  train_files = [os.path.relpath(f, config.dataset_configs.base_dir) for f in train_files]
+  test_files = [os.path.relpath(f, config.dataset_configs.base_dir) for f in test_files]
+  
+  config.dataset_configs.tables = {
+      'train': train_files,
+      'validation': test_files,
+      'test': test_files,
+  }
   
   config.dataset_configs.examples_per_subset = {
       'train': VGGSOUND_TRAIN_SIZE,
@@ -67,13 +70,16 @@ def get_config():
   
   # List of modalities to load, supports `rgb` and `spectrogram'.
   config.dataset_configs.modalities = ('spectrogram', 'rgb')
+  # Must be True for multi-modal training (when using both RGB and spectrogram)
+  # Model returns dict during training, pooled output during eval
   config.dataset_configs.return_as_dict = True
   
   # VGGSound videos are 10 seconds at 25fps = 250 frames
-  # Sample 32 frames with stride 2 (covers ~2.5 seconds of the 10-second clip)
-  config.dataset_configs.num_frames = 32
-  config.dataset_configs.stride = 2
-  config.dataset_configs.num_spec_frames = 8
+  # Sample fewer frames to reduce memory usage on single GPU
+  config.dataset_configs.num_frames = 8  # Reduced from 32 to minimize attention memory
+  config.dataset_configs.stride = 8  # Increased stride to cover similar time span
+  # VGGSound spectrograms: 1001 time steps total, sample fewer time steps
+  config.dataset_configs.num_spec_frames = 25  # Reduced from 100 to minimize attention memory
   config.dataset_configs.spec_stride = 1
 
   # Audio spectrogram statistics (you may need to calculate these from your data)
@@ -83,7 +89,9 @@ def get_config():
 
   config.dataset_configs.min_resize = 256
   config.dataset_configs.crop_size = 224
-  config.dataset_configs.spec_shape = (100, 128)
+  # VGGSound TFRecords: each frame in the sequence has shape (1, 128)
+  # We'll sample num_spec_frames=100 frames to get a (100, 128) spectrogram
+  config.dataset_configs.spec_shape = (1, 128)
 
   config.dataset_configs.one_hot_labels = True
   config.dataset_configs.zero_centering = True
@@ -92,7 +100,7 @@ def get_config():
   config.dataset_configs.do_multicrop_test = True
   config.dataset_configs.log_test_epochs = 4
   config.dataset_configs.num_test_clips = 4
-  config.dataset_configs.test_batch_size = 8
+  config.dataset_configs.test_batch_size = 1  # Must equal number of GPUs (jax.local_device_count())
   config.multicrop_clips_per_device = 2
 
   # Data augmentation
@@ -118,8 +126,8 @@ def get_config():
   config.dataset_configs.spec_augment_params.time_warp_max_ratio = 0
   config.dataset_configs.spec_augment_params.time_mask_max_ratio = 0
 
-  # Model: MBT-base
-  config.model_name = 'mbt_multilabel_classification'
+  # Model: MBT-base for single-label multi-class classification
+  config.model_name = 'mbt_classification'  # Use softmax, not sigmoid
   config.model = ml_collections.ConfigDict()
   config.model.modality_fusion = ('spectrogram', 'rgb')
   config.model.use_bottleneck = True
@@ -154,7 +162,7 @@ def get_config():
   config.max_grad_norm = 1
   config.label_smoothing = 0.3
   config.num_training_epochs = 50
-  config.batch_size = 64
+  config.batch_size = 1  # Minimum batch size for single GPU with limited VRAM
   config.rng_seed = 0
   
   config.mixup = ml_collections.ConfigDict()
@@ -165,7 +173,7 @@ def get_config():
   # Pre-trained weights initialization
   config.init_from = ml_collections.ConfigDict()
   config.init_from.model_config = None
-  config.init_from.checkpoint_path = None  # Set to pretrained ViT path if available
+  config.init_from.checkpoint_path = "/home/labuta/Documents/Bram/scenic_PhD/CheckPoints/ViT_B_16_ImageNet1k_dir"  # Set to pretrained ViT path if available
   config.init_from.checkpoint_format = 'scenic'
   config.init_from.model_config = ml_collections.ConfigDict()
   config.init_from.model_config.model = ml_collections.ConfigDict()
