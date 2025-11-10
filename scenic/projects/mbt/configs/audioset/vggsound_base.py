@@ -113,7 +113,9 @@ def get_config():
   config.dataset_configs.augmentation_params.prob_color_augment = 0.8
   config.dataset_configs.augmentation_params.prob_color_drop = 0.1
 
-  config.dataset_configs.prefetch_to_device = 2
+  # Increase prefetching to keep GPU fed with data
+  config.dataset_configs.prefetch_to_device = 8  # Increased from 2
+  config.dataset_configs.prefetch_to_host = 4    # Also prefetch to CPU RAM
 
   # SpecAugment hyperparameters
   config.dataset_configs.spec_augment = True
@@ -162,7 +164,7 @@ def get_config():
   config.max_grad_norm = 1
   config.label_smoothing = 0.3
   config.num_training_epochs = 50
-  config.batch_size = 1  # Minimum batch size for single GPU with limited VRAM
+  config.batch_size = 16  # Minimum batch size for single GPU with limited VRAM
   config.rng_seed = 0
   
   config.mixup = ml_collections.ConfigDict()
@@ -194,9 +196,13 @@ def get_config():
 
   # Logging
   config.write_summary = True
-  config.checkpoint = True
+  config.checkpoint = False  # Temporarily disable to debug step 2 issue
   config.debug_train = False
   config.debug_eval = False
   config.checkpoint_steps = 500
+  
+  # Eval every 5 epochs instead of every epoch to speed up training
+  # This reduces eval overhead from 50% to ~10%
+  config.log_eval_steps = 5 * steps_per_epoch  # Eval every 5 epochs
   
   return config
