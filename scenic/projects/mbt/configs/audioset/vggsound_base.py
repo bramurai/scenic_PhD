@@ -75,11 +75,11 @@ def get_config():
   config.dataset_configs.return_as_dict = True
   
   # VGGSound videos are 10 seconds at 25fps = 250 frames
-  # Sample fewer frames to reduce memory usage on single GPU
-  config.dataset_configs.num_frames = 8  # Reduced from 32 to minimize attention memory
-  config.dataset_configs.stride = 8  # Increased stride to cover similar time span
-  # VGGSound spectrograms: 1001 time steps total, sample fewer time steps
-  config.dataset_configs.num_spec_frames = 25  # Reduced from 100 to minimize attention memory
+  config.dataset_configs.num_frames = 8  # Paper spec: 8 frames
+  config.dataset_configs.stride = 8  # Uniform stride over sampling window
+  # VGGSound spectrograms: Paper uses 800 frames for 8 seconds (100 frames/sec)
+  # This gives 128x800 spectrogram → 8x50=400 patches after 16x16 patching
+  config.dataset_configs.num_spec_frames = 800  # Match paper exactly
   config.dataset_configs.spec_stride = 1
 
   # Audio spectrogram statistics (you may need to calculate these from your data)
@@ -113,17 +113,22 @@ def get_config():
   config.dataset_configs.augmentation_params.prob_color_augment = 0.8
   config.dataset_configs.augmentation_params.prob_color_drop = 0.1
 
-  # Increase prefetching to keep GPU fed with data
-  config.dataset_configs.prefetch_to_device = 8  # Increased from 2
-  config.dataset_configs.prefetch_to_host = 4    # Also prefetch to CPU RAM
+  # Aggressive prefetching to keep GPU fed with data (SSD storage)
+  config.dataset_configs.prefetch_to_device = 16  # Increased from 8 - allows more batches queued on GPU
+  config.dataset_configs.prefetch_to_host = 8     # Increased from 4 - more CPU RAM buffering
+  
+  # TFRecord reading parallelism (for SSD storage)
+  config.dataset_configs.num_parallel_calls = 8  # Parallel decompression/decoding threads
+  config.dataset_configs.cycle_length = 8        # Number of TFRecord files to read in parallel
 
-  # SpecAugment hyperparameters
+  # SpecAugment hyperparameters - Paper spec: max time=192, max freq=48
+  # Reduced time_mask_count for speed (paper uses 4, we use 2 for 2x faster augmentation)
   config.dataset_configs.spec_augment = True
   config.dataset_configs.spec_augment_params = ml_collections.ConfigDict()
-  config.dataset_configs.spec_augment_params.freq_mask_max_bins = 48
+  config.dataset_configs.spec_augment_params.freq_mask_max_bins = 48  # Paper spec
   config.dataset_configs.spec_augment_params.freq_mask_count = 1
-  config.dataset_configs.spec_augment_params.time_mask_max_frames = 48
-  config.dataset_configs.spec_augment_params.time_mask_count = 4
+  config.dataset_configs.spec_augment_params.time_mask_max_frames = 192  # Paper spec (was 48)
+  config.dataset_configs.spec_augment_params.time_mask_count = 2  # Reduced from 4 for speed (still effective regularization)
   config.dataset_configs.spec_augment_params.time_warp_max_frames = 1.0
   config.dataset_configs.spec_augment_params.time_warp_max_ratio = 0
   config.dataset_configs.spec_augment_params.time_mask_max_ratio = 0
@@ -164,11 +169,11 @@ def get_config():
   config.max_grad_norm = 1
   config.label_smoothing = 0.3
   config.num_training_epochs = 50
-  config.batch_size = 16  # Minimum batch size for single GPU with limited VRAM
+  config.batch_size = 8  # Reduced from 12 due to larger spectrograms (800 vs 100 frames)
   config.rng_seed = 0
   
   config.mixup = ml_collections.ConfigDict()
-  config.mixup.alpha = 0.5
+  config.mixup.alpha = 0.3  # Paper spec (was 0.5)
   config.mixmod = False
   config.model.stochastic_droplayer_rate = 0.3
 

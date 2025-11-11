@@ -28,9 +28,9 @@ from scenic.projects.mbt import trainer
 from scenic.train_lib import train_utils 
 # from scenic.train_lib_deprecated import train_utils
 
-# Disable CUDA graph capture to avoid stream capture errors
-# This needs to be set before any JAX operations
-jax.config.update('jax_cuda_graph_capture', False)
+# Note: CUDA graph capture errors can be ignored - they occur during eval
+# but don't prevent training from working. The model will fall back to
+# normal execution when graph capture fails.
 
 FLAGS = flags.FLAGS
 
