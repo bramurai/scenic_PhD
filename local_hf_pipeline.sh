@@ -14,8 +14,7 @@
 set -e  # Exit on any error
 
 # Configuration
-SPLIT=${1:-train}  # train or test
-START_TAR=${2:-0}  # Which tar file to start from (0-19)
+START_TAR=${1:-0}  # Which tar file to start from (0-19)
 BATCH_SIZE=2000
 NUM_TARS=20
 NUM_WORKERS=24  # Number of parallel workers for video processing
@@ -23,27 +22,15 @@ NUM_WORKERS=24  # Number of parallel workers for video processing
 # Paths
 WORK_DIR="$(pwd)"
 TEMP_DIR="${WORK_DIR}/vggsound_temp"
-OUTPUT_DIR="${WORK_DIR}/${SPLIT}_tfrecords_local"
-CSV_FILE="${WORK_DIR}/PreProcessing/vggsound_${SPLIT}.csv"
 
 # HuggingFace dataset URL
 BASE_URL="https://huggingface.co/datasets/Loie/VGGSound/resolve/main"
 
-# Count total videos in CSV (excluding header)
-if [ ! -f "$CSV_FILE" ]; then
-    echo "ERROR: CSV file not found: $CSV_FILE"
-    exit 1
-fi
-
-TOTAL_VIDEOS=$(tail -n +2 "$CSV_FILE" | wc -l)
-
 echo "============================================"
-echo "VGGSound LOCAL Pipeline - ${SPLIT^^} SET"
+echo "VGGSound LOCAL Pipeline - TRAIN & TEST"
 echo "============================================"
-echo "Total videos: $TOTAL_VIDEOS"
 echo "Batch size: $BATCH_SIZE"
 echo "Starting from tar: $START_TAR"
-echo "Output directory: $OUTPUT_DIR"
 echo "Temporary directory: $TEMP_DIR"
 echo ""
 
@@ -103,13 +90,41 @@ print('✓ All dependencies installed')
 
 # Create directories
 mkdir -p "$TEMP_DIR"
-mkdir -p "$OUTPUT_DIR"
 
 echo "✓ Environment checks passed"
 echo ""
 
-# Process each tar file one by one
-for ((tar_id=START_TAR; tar_id<NUM_TARS; tar_id++)); do
+# Process both train and test splits
+for SPLIT in train test; do
+    echo ""
+    echo "###############################################"
+    echo "# Processing ${SPLIT^^} split"
+    echo "###############################################"
+    echo ""
+    
+    OUTPUT_DIR="${WORK_DIR}/${SPLIT}_tfrecords_local"
+    CSV_FILE="${WORK_DIR}/PreProcessing/vggsound_${SPLIT}.csv"
+    
+    # Count total videos in CSV (excluding header)
+    if [ ! -f "$CSV_FILE" ]; then
+        echo "ERROR: CSV file not found: $CSV_FILE"
+        echo "Skipping ${SPLIT} split..."
+        continue
+    fi
+    
+    TOTAL_VIDEOS=$(tail -n +2 "$CSV_FILE" | wc -l)
+    
+    echo "Split: ${SPLIT}"
+    echo "Total videos: $TOTAL_VIDEOS"
+    echo "Output directory: $OUTPUT_DIR"
+    echo "CSV file: $CSV_FILE"
+    echo ""
+    
+    # Create output directory
+    mkdir -p "$OUTPUT_DIR"
+    
+    # Process each tar file one by one
+    for ((tar_id=START_TAR; tar_id<NUM_TARS; tar_id++)); do
     TAR_NUM=$(printf "%02d" $tar_id)
     TAR_FILE="vggsound_${TAR_NUM}.tar.gz"
     TAR_PATH="${TEMP_DIR}/${TAR_FILE}"
@@ -263,14 +278,14 @@ for ((tar_id=START_TAR; tar_id<NUM_TARS; tar_id++)); do
     
     # Show progress
     completed_batches=$(find "$OUTPUT_DIR" -name ".complete" 2>/dev/null | wc -l)
-    echo "Overall progress: $completed_batches/$TOTAL_BATCHES batches completed"
+    echo "Overall progress for ${SPLIT}: $completed_batches/$TOTAL_BATCHES batches completed"
     echo ""
 done
 
-# Final summary
+# Summary for this split
 echo ""
 echo "============================================"
-echo "Pipeline Complete!"
+echo "${SPLIT^^} Split Complete!"
 echo "============================================"
 echo "TFRecords saved to: $OUTPUT_DIR"
 echo ""
@@ -282,6 +297,31 @@ total_tfrecords=$(find "$OUTPUT_DIR" -name "*.tfrecord" 2>/dev/null | wc -l)
 echo "Statistics:"
 echo "  Completed batches: $completed_batches/$TOTAL_BATCHES"
 echo "  Total TFRecord files: $total_tfrecords"
+echo ""
+
+done  # End of train/test loop
+
+# Final summary
+echo ""
+echo "============================================"
+echo "Pipeline Complete - ALL SPLITS!"
+echo "============================================"
+
+# Summary for both splits
+for SPLIT in train test; do
+    OUTPUT_DIR="${WORK_DIR}/${SPLIT}_tfrecords_local"
+    if [ -d "$OUTPUT_DIR" ]; then
+        completed_batches=$(find "$OUTPUT_DIR" -name ".complete" 2>/dev/null | wc -l)
+        total_tfrecords=$(find "$OUTPUT_DIR" -name "*.tfrecord" 2>/dev/null | wc -l)
+        
+        echo ""
+        echo "${SPLIT^^} split:"
+        echo "  Output: $OUTPUT_DIR"
+        echo "  Completed batches: $completed_batches"
+        echo "  Total TFRecord files: $total_tfrecords"
+    fi
+done
+
 echo ""
 
 # Cleanup temp directory

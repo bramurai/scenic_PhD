@@ -13,50 +13,52 @@
 # limitations under the License.
 
 # pylint: disable=line-too-long
-r"""Multimodal sound classification on the balanced (mini) AudioSet.
+r"""Inference configuration for neural activation and attention analysis.
 
+This config is designed to:
+1. Load 9 test samples from Audioset_test
+2. Extract layer-wise activations
+3. Extract attention weights from all attention layers
+4. Save outputs for analysis
 """
 # pylint: disable=line-too-long
 
 import ml_collections
 
-# The size of the AudioSet dataset changes as videos are removed from YouTube.
-# Update this accordingly.
-AUDIOSET_TRAIN_SIZE = 20361
+# 9 test samples in Audioset_test folder
+AUDIOSET_TEST_SIZE = 9
 
 
 def get_config():
-  """Returns the base experiment configuration."""
+  """Returns the inference configuration for activation analysis."""
   config = ml_collections.ConfigDict()
-  config.experiment_name = 'mbt_balanced_audioset_classification'
-  config.dataset_name = 'audiovisual_tfrecord_dataset' #added dataset_name
+  config.experiment_name = 'mbt_activation_analysis'
+  config.dataset_name = 'audiovisual_tfrecord_dataset'
 
-  # Dataset.
-  config.dataset_configs = ml_collections.ConfigDict() # added ml_collections.ConfigDict()
-  config.dataset_configs.base_dir = 'generated_dataset'  # '/path/to/dataset'
+  # Dataset - pointing to Audioset_test folder with 9 samples
+  config.dataset_configs = ml_collections.ConfigDict()
+  config.dataset_configs.base_dir = 'Audioset_test'
   config.dataset_configs.tables = {
-      'train': 'balanced_train.se.melspec.tfrecord.sst@1024',
-      'validation': 'eval.se.melspec.tfrecord.sst@1024',
-      'test': 'eval.se.melspec.tfrecord.sst@1024',
+      'train': ['data-00000-of-00001.tfrecord'],  # Use test data as "train" for simplicity
+      'validation': ['data-00000-of-00001.tfrecord'],
+      'test': ['data-00000-of-00001.tfrecord'],
   }
   config.dataset_configs.examples_per_subset = {
-      'train': 20361,
-      'validation': 18589,
-      'test': 18589
+      'train': AUDIOSET_TEST_SIZE,
+      'validation': AUDIOSET_TEST_SIZE,
+      'test': AUDIOSET_TEST_SIZE
   }
   config.dataset_configs.num_classes = 527
   config.data_dtype_str = 'float32'
   
-  # List of modalities to load, supports `rgb` and `spectrogram'.
-  # Note that this only specifies which modalities to load, not which to use,
-  # which is controlled by config.model.modality_fusion
+  # List of modalities to load
   config.dataset_configs.modalities = ('spectrogram', 'rgb')
   config.dataset_configs.return_as_dict = True
-  # This is going to sample 32 frames, sampled at a stride of 2 from the video.
-  # AudioSet videos are extracted at 25fps.
-  config.dataset_configs.num_frames = 32
-  config.dataset_configs.stride = 2
-  config.dataset_configs.num_spec_frames = 8
+  
+  # Match the preprocessing from training
+  config.dataset_configs.num_frames = 8
+  config.dataset_configs.stride = 8
+  config.dataset_configs.num_spec_frames = 800  # Match VGGSound training config
   config.dataset_configs.spec_stride = 1
 
   # These statistics were calculated over the entire unbalanced train set.
@@ -139,57 +141,55 @@ def get_config():
   config.model.temporal_encoding_config.kernel_init_method = 'central_frame_initializer'
   config.model.temporal_encoding_config.n_sampled_frames = 4  # Unused here.
 
-  # Training.
+  # Inference/analysis specific settings
+  config.analysis_mode = True  # Flag to enable activation extraction
+  config.save_activations = True
+  config.save_attention_weights = True
+  config.output_dir = 'analysis_outputs'  # Where to save activations
+  
+  # Training settings (not used for inference, but required by framework)
   config.trainer_name = 'mbt_trainer'
   config.optimizer = 'momentum'
   config.optimizer_configs = ml_collections.ConfigDict()
   config.l2_decay_factor = 0
   config.max_grad_norm = 1
-  config.label_smoothing = 0.3
-  config.num_training_epochs = 50
-  config.batch_size = 64
+  config.label_smoothing = 0.0
+  config.num_training_epochs = 1  # Just 1 pass through data
+  config.batch_size = 1  # Process one sample at a time for detailed analysis
   config.rng_seed = 0
-  # This does Mixup in the train loop. This is fast. But make sure that device
-  # batch size is more than 1. On a 4x4 TPU, this means that your batch size
-  # needs to be at least 64.
+  
+  # Disable augmentations for inference
   config.mixup = ml_collections.ConfigDict()
-  config.mixup.alpha = 0.5
+  config.mixup.alpha = 0.0  # No mixup during inference
   config.mixmod = False
-  # Additional regularization
-  config.model.stochastic_droplayer_rate = 0.3
+  config.model.stochastic_droplayer_rate = 0.0  # No stochastic depth during inference
 
   # Use ImageNet-21k-initialised model from big_vision checkpoint
   config.init_from = ml_collections.ConfigDict()
   config.init_from.model_config = None
  
-  # Download pretrained ImageNet checkpoints from here:
-  # https://github.com/google-research/scenic/tree/main/scenic/projects/baselines (checkpoint_format = 'scenic')  pylint: disable=line-too-long
-  # https://github.com/google-research/vision_transformer (checkpoint_format = 'big_vision')  pylint: disable=line-too-long
-  config.init_from.checkpoint_path = 'path_to_checkpoint_of_vit_b_16'
+  # Point to your trained checkpoint for inference
+  config.init_from.checkpoint_path = 'mbt_base'  # Path to trained model checkpoint
   config.init_from.checkpoint_format = 'scenic'
   config.init_from.model_config = ml_collections.ConfigDict()
   config.init_from.model_config.model = ml_collections.ConfigDict()
-  config.init_from.model_config.model.classifier = 'token'  # Specify if this is 'token' or 'gap'.  pylint: disable=line-too-long
+  config.init_from.model_config.model.classifier = 'gap'
   config.init_from.restore_positional_embedding = True
   config.init_from.restore_input_embedding = True
   config.init_from.positional_embed_size_change = 'resize_tile'
 
-  # Learning rate.
-  steps_per_epoch = AUDIOSET_TRAIN_SIZE // config.batch_size
+  # Learning rate (not used for inference, but required)
+  steps_per_epoch = AUDIOSET_TEST_SIZE // config.batch_size
   total_steps = config.num_training_epochs * steps_per_epoch
   config.lr_configs = ml_collections.ConfigDict()
-  config.lr_configs.learning_rate_schedule = 'compound'
-  config.lr_configs.factors = 'constant * cosine_decay * linear_warmup'
-  config.lr_configs.warmup_steps = 2.5 * steps_per_epoch
-  config.lr_configs.steps_per_cycle = total_steps
-  config.lr_configs.base_learning_rate = 5e-1
+  config.lr_configs.learning_rate_schedule = 'constant'
+  config.lr_configs.base_learning_rate = 0.0  # No learning during inference
 
-  # Logging.
-  config.write_summary = True
-  config.checkpoint = True  # Do checkpointing.
-  config.debug_train = False  # Debug mode during training.
-  config.debug_eval = False  # Debug mode during eval.
-  config.checkpoint_steps = 500  # Checkpoint more frequently than a val epoch.
+  # Logging
+  config.write_summary = False  # No tensorboard logging needed
+  config.checkpoint = False  # Don't save checkpoints during inference
+  config.debug_train = False
+  config.debug_eval = False
   return config
 
 

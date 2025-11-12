@@ -75,11 +75,10 @@ def get_config():
   config.dataset_configs.return_as_dict = True
   
   # VGGSound videos are 10 seconds at 25fps = 250 frames
-  config.dataset_configs.num_frames = 8  # Paper spec: 8 frames
-  config.dataset_configs.stride = 8  # Uniform stride over sampling window
-  # VGGSound spectrograms: Paper uses 800 frames for 8 seconds (100 frames/sec)
-  # This gives 128x800 spectrogram → 8x50=400 patches after 16x16 patching
-  config.dataset_configs.num_spec_frames = 800  # Match paper exactly
+  config.dataset_configs.num_frames = 32  # Paper spec: 8 frames
+  config.dataset_configs.stride = 2  # Uniform stride over sampling window
+
+  config.dataset_configs.num_spec_frames = 8  # chunkes instead of 800 individuals
   config.dataset_configs.spec_stride = 1
 
   # Audio spectrogram statistics (you may need to calculate these from your data)
@@ -91,7 +90,7 @@ def get_config():
   config.dataset_configs.crop_size = 224
   # VGGSound TFRecords: each frame in the sequence has shape (1, 128)
   # We'll sample num_spec_frames=100 frames to get a (100, 128) spectrogram
-  config.dataset_configs.spec_shape = (1, 128)
+  config.dataset_configs.spec_shape = (100, 128)
 
   config.dataset_configs.one_hot_labels = True
   config.dataset_configs.zero_centering = True
@@ -127,8 +126,8 @@ def get_config():
   config.dataset_configs.spec_augment_params = ml_collections.ConfigDict()
   config.dataset_configs.spec_augment_params.freq_mask_max_bins = 48  # Paper spec
   config.dataset_configs.spec_augment_params.freq_mask_count = 1
-  config.dataset_configs.spec_augment_params.time_mask_max_frames = 192  # Paper spec (was 48)
-  config.dataset_configs.spec_augment_params.time_mask_count = 2  # Reduced from 4 for speed (still effective regularization)
+  config.dataset_configs.spec_augment_params.time_mask_max_frames = 48  # Paper spec (was 48)
+  config.dataset_configs.spec_augment_params.time_mask_count = 4  # Reduced from 4 for speed (still effective regularization)
   config.dataset_configs.spec_augment_params.time_warp_max_frames = 1.0
   config.dataset_configs.spec_augment_params.time_warp_max_ratio = 0
   config.dataset_configs.spec_augment_params.time_mask_max_ratio = 0

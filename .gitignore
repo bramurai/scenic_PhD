@@ -13,3 +13,14 @@ build/lib/scenic/projects/knowledge_visual_language/configs/wit_retrieval_soft_g
 *.gz/
 *.mp4
 **/*.mp4 
+*.v2
+*.gz
+*.tfrecords
+*.tfrecord
+CheckPoints/
+*.pb
+*.aria2
+scenic.egg-info/
+train_tfrecords_local
+scenic.egg-info/PKG-INFO
+test_tfrecords_local

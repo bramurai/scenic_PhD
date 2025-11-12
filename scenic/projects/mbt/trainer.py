@@ -731,7 +731,8 @@ def train(
       train_metrics, extra_training_logs = [], []
 
     ################### EVALUATION ################################
-    if (step % log_eval_steps == 1) or (step == total_steps):
+    # Only run eval at log_eval_steps intervals and at the final step (skip step 1)
+    if ((step % log_eval_steps == 0 and step > 0) or (step == total_steps)):
       print(f'\n[Step {step}] Starting evaluation...', flush=True)
       t0_eval = time.time()
       with report_progress.timed('eval'):

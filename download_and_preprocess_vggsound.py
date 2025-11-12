@@ -174,24 +174,29 @@ def download_youtube_video(video_id: str, start_time: int, output_path: str,
             return True
         else:
             # Log detailed error for debugging
-            error_msg = result.stderr if result.stderr else "Unknown error"
+            error_msg = result.stderr if result.stderr else result.stdout if result.stdout else "Unknown error"
             logging.warning(f"Failed to download {video_id} at {start_time}s")
+            logging.warning(f"yt-dlp error: {error_msg}")
+            logging.warning(f"Return code: {result.returncode}")
             return False
             
     except subprocess.TimeoutExpired:
-        logging.warning(f"Timeout downloading {video_id}")
+        logging.warning(f"Timeout downloading {video_id} after 60 seconds")
         return False
     except Exception as e:
         logging.warning(f"Error downloading {video_id}: {e}")
+        import traceback
+        logging.warning(f"Traceback: {traceback.format_exc()}")
         return False
 
 
-def process_video_entry(row: dict, temp_dir: str, **kwargs) -> Optional[object]:
+def process_video_entry(row: dict, temp_dir: str, label_to_index: Optional[dict] = None, **kwargs) -> Optional[object]:
     """Download video temporarily, process it, and delete it.
     
     Args:
         row: CSV row with video_id, start, end, label, clip_id.
         temp_dir: Temporary directory for downloads.
+        label_to_index: Dictionary mapping label strings to indices.
         **kwargs: Additional arguments for create_sequence_example.
         
     Returns:
@@ -255,6 +260,7 @@ def process_video_entry(row: dict, temp_dir: str, **kwargs) -> Optional[object]:
             end_time=end_time,      # 10 second clips
             label=label,
             clip_id=clip_id,
+            label_to_index=label_to_index,
             **kwargs
         )
 
@@ -295,6 +301,23 @@ def main(argv):
     df = pd.read_csv(FLAGS.csv_path)
     total_examples = len(df)
     logging.info(f"Processing {total_examples} examples")
+    
+    # Create label-to-index mapping from unique labels in CSV
+    label_to_index = None
+    if 'label' in df.columns:
+        unique_labels = sorted(df['label'].dropna().unique())
+        label_to_index = {label: idx for idx, label in enumerate(unique_labels)}
+        logging.info(f"Created label mapping with {len(label_to_index)} unique labels")
+        
+        # Save label mapping to output directory for reference
+        os.makedirs(FLAGS.output_path, exist_ok=True)
+        label_mapping_path = os.path.join(FLAGS.output_path, 'label_mapping.txt')
+        with open(label_mapping_path, 'w') as f:
+            for label, idx in sorted(label_to_index.items(), key=lambda x: x[1]):
+                f.write(f"{idx}\t{label}\n")
+        logging.info(f"Saved label mapping to {label_mapping_path}")
+    else:
+        logging.warning("No 'label' column found in CSV")
     
     # Create output directory
     os.makedirs(FLAGS.output_path, exist_ok=True)
@@ -372,6 +395,7 @@ def main(argv):
         sequence_example = process_video_entry(
             row.to_dict(),
             temp_dir,
+            label_to_index=label_to_index,
             target_fps=FLAGS.target_fps,
             decode_audio=FLAGS.decode_audio,
             audio_sample_rate=FLAGS.audio_sample_rate,

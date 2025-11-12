@@ -340,9 +340,32 @@ def load_split_from_dmvr(ds_factory,
   if not is_training:
     ds = ds.repeat(None)
 
+  # Configure TensorFlow dataset options for optimal performance
   options = tf.data.Options()
   options.experimental_threading.private_threadpool_size = 48
+  
+  # Enable autotune for dynamic optimization
+  options.autotune.enabled = True
+  
+  # Enable parallel data extraction and transformation
+  options.threading.max_intra_op_parallelism = 1
+  
+  # Disable order enforcement for better throughput (training only)
+  if is_training:
+    options.deterministic = False
+  
+  # Optimize interleave cycle length and block length for better parallelism
+  options.experimental_optimization.map_and_batch_fusion = True
+  options.experimental_optimization.parallel_batch = True
+  
   ds = ds.with_options(options)
+  
+  # Apply prefetch as the LAST operation in the TF dataset pipeline
+  # This ensures data is ready in CPU RAM before being consumed
+  if is_training:
+    # Use a large buffer to ensure GPU never starves
+    logging.info('Applying tf.data.prefetch with buffer_size=AUTOTUNE')
+    ds = ds.prefetch(tf.data.AUTOTUNE)
 
   return ds, num_examples
 
@@ -483,6 +506,7 @@ def get_dataset(
         zero_centering=zero_centre_data,
         augmentation_params=augmentation_params,
         keep_key=keep_key_local)
+    
     if dataset_service_address and is_training:
       if shuffle_seed is not None:
         raise ValueError('Using dataset service with a random seed causes each '

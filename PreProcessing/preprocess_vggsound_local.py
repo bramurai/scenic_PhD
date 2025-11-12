@@ -15,7 +15,7 @@ from functools import partial
 # Add scenic to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-def process_single_video(video_info):
+def process_single_video(video_info, label_to_index):
     """Process a single video and return the serialized SequenceExample."""
     try:
         from generate_audiovisual_from_file import create_sequence_example
@@ -32,7 +32,8 @@ def process_single_video(video_info):
             n_mels=128,
             win_length_ms=25.0,
             hop_length_ms=10.0,
-            min_resize=256
+            min_resize=256,
+            label_to_index=label_to_index  # ✓ FIXED: Now passing label mapping
         )
         
         return (True, video_info['video_id'], sequence_example.SerializeToString())
@@ -66,10 +67,29 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     
     videos_to_process = []
+    all_labels = set()
     
     with open(args.csv_file, 'r') as f:
         reader = csv.DictReader(f)
         rows = list(reader)
+        
+        # First pass: collect all unique labels from the ENTIRE CSV
+        # This ensures consistent label indices across all batches
+        for row in rows:
+            row = {k.strip(): v.strip() for k, v in row.items()}
+            if 'label' in row and row['label']:
+                all_labels.add(row['label'])
+        
+        # Create label-to-index mapping sorted alphabetically
+        label_to_index = {label: idx for idx, label in enumerate(sorted(all_labels))}
+        print(f"Created label mapping with {len(label_to_index)} unique labels")
+        
+        # Save label mapping to output directory for reference
+        label_mapping_path = output_dir / 'label_mapping.txt'
+        with open(label_mapping_path, 'w') as f_mapping:
+            for label, idx in sorted(label_to_index.items(), key=lambda x: x[1]):
+                f_mapping.write(f"{idx}\t{label}\n")
+        print(f"Saved label mapping to {label_mapping_path}")
         
         # Process only the specified row range
         for idx in range(args.start_row, min(args.end_row, len(rows))):
@@ -113,10 +133,13 @@ def main():
     successful = 0
     failed = 0
     
+    # Create a partial function with label_to_index bound
+    process_func = partial(process_single_video, label_to_index=label_to_index)
+    
     try:
         with Pool(processes=args.num_workers) as pool:
             # Process videos in parallel
-            for idx, result in enumerate(pool.imap(process_single_video, videos_to_process)):
+            for idx, result in enumerate(pool.imap(process_func, videos_to_process)):
                 success, video_id, data = result
                 
                 if success:

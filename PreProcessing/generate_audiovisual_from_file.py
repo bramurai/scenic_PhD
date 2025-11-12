@@ -224,7 +224,8 @@ def create_sequence_example(video_path: str, start_time: float, end_time: float,
                            n_mels: int = 128,
                            win_length_ms: float = 25.0,
                            hop_length_ms: float = 10.0,
-                           min_resize: int = 256) -> tf.train.SequenceExample:
+                           min_resize: int = 256,
+                           label_to_index: Optional[Dict[str, int]] = None) -> tf.train.SequenceExample:
     """Create a SequenceExample for one video clip.
     
     Args:
@@ -241,6 +242,7 @@ def create_sequence_example(video_path: str, start_time: float, end_time: float,
         win_length_ms: Window length in ms.
         hop_length_ms: Hop length in ms.
         min_resize: Resize frames so shortest side equals this (default 256).
+        label_to_index: Dictionary mapping label strings to indices (required if label is provided).
         
     Returns:
         A tf.train.SequenceExample.
@@ -259,8 +261,19 @@ def create_sequence_example(video_path: str, start_time: float, end_time: float,
     
     if label is not None:
         context_dict['clip/label/string'] = create_bytes_feature(label.encode('utf-8'))
-        # Note: For multi-class, you'd need label_to_index mapping
-        context_dict['clip/label/index'] = create_int64_feature(0)  # Placeholder
+        
+        # Use label_to_index mapping if provided, otherwise use placeholder
+        if label_to_index is not None:
+            if label in label_to_index:
+                label_idx = label_to_index[label]
+            else:
+                logging.warning(f"Label '{label}' not found in label_to_index mapping, using -1")
+                label_idx = -1
+        else:
+            logging.warning("No label_to_index mapping provided, all labels will be mapped to 0")
+            label_idx = 0
+        
+        context_dict['clip/label/index'] = create_int64_feature(label_idx)
     
     if caption is not None:
         context_dict['clip/caption/string'] = create_bytes_feature(caption.encode('utf-8'))
@@ -316,12 +329,13 @@ def create_sequence_example(video_path: str, start_time: float, end_time: float,
     return sequence_example
 
 
-def process_csv_row(row: Dict, video_root_path: str, **kwargs) -> Optional[tf.train.SequenceExample]:
+def process_csv_row(row: Dict, video_root_path: str, label_to_index: Optional[Dict[str, int]] = None, **kwargs) -> Optional[tf.train.SequenceExample]:
     """Process one row from the CSV file.
     
     Args:
         row: Dictionary with CSV row data.
         video_root_path: Root path for video files.
+        label_to_index: Dictionary mapping label strings to indices.
         **kwargs: Additional arguments for create_sequence_example.
         
     Returns:
@@ -345,6 +359,7 @@ def process_csv_row(row: Dict, video_root_path: str, **kwargs) -> Optional[tf.tr
             label=label,
             caption=caption,
             clip_id=clip_id,
+            label_to_index=label_to_index,
             **kwargs
         )
     except Exception as e:
@@ -364,6 +379,23 @@ def main(argv):
     
     total_examples = len(df)
     logging.info(f"Processing {total_examples} examples")
+    
+    # Create label-to-index mapping from unique labels in CSV
+    label_to_index = None
+    if 'label' in df.columns:
+        unique_labels = sorted(df['label'].dropna().unique())
+        label_to_index = {label: idx for idx, label in enumerate(unique_labels)}
+        logging.info(f"Created label mapping with {len(label_to_index)} unique labels")
+        
+        # Save label mapping to output directory for reference
+        os.makedirs(FLAGS.output_path, exist_ok=True)
+        label_mapping_path = os.path.join(FLAGS.output_path, 'label_mapping.txt')
+        with open(label_mapping_path, 'w') as f:
+            for label, idx in sorted(label_to_index.items(), key=lambda x: x[1]):
+                f.write(f"{idx}\t{label}\n")
+        logging.info(f"Saved label mapping to {label_mapping_path}")
+    else:
+        logging.warning("No 'label' column found in CSV")
     
     # Create output directory
     os.makedirs(FLAGS.output_path, exist_ok=True)
@@ -388,6 +420,7 @@ def main(argv):
         sequence_example = process_csv_row(
             row.to_dict(),
             FLAGS.video_root_path,
+            label_to_index=label_to_index,
             target_fps=FLAGS.target_fps,
             decode_audio=FLAGS.decode_audio,
             audio_sample_rate=FLAGS.audio_sample_rate,
