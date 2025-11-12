@@ -94,37 +94,8 @@ mkdir -p "$TEMP_DIR"
 echo "✓ Environment checks passed"
 echo ""
 
-# Process both train and test splits
-for SPLIT in train test; do
-    echo ""
-    echo "###############################################"
-    echo "# Processing ${SPLIT^^} split"
-    echo "###############################################"
-    echo ""
-    
-    OUTPUT_DIR="${WORK_DIR}/${SPLIT}_tfrecords_local"
-    CSV_FILE="${WORK_DIR}/PreProcessing/vggsound_${SPLIT}.csv"
-    
-    # Count total videos in CSV (excluding header)
-    if [ ! -f "$CSV_FILE" ]; then
-        echo "ERROR: CSV file not found: $CSV_FILE"
-        echo "Skipping ${SPLIT} split..."
-        continue
-    fi
-    
-    TOTAL_VIDEOS=$(tail -n +2 "$CSV_FILE" | wc -l)
-    
-    echo "Split: ${SPLIT}"
-    echo "Total videos: $TOTAL_VIDEOS"
-    echo "Output directory: $OUTPUT_DIR"
-    echo "CSV file: $CSV_FILE"
-    echo ""
-    
-    # Create output directory
-    mkdir -p "$OUTPUT_DIR"
-    
-    # Process each tar file one by one
-    for ((tar_id=START_TAR; tar_id<NUM_TARS; tar_id++)); do
+# Process each tar file one by one
+for ((tar_id=START_TAR; tar_id<NUM_TARS; tar_id++)); do
     TAR_NUM=$(printf "%02d" $tar_id)
     TAR_FILE="vggsound_${TAR_NUM}.tar.gz"
     TAR_PATH="${TEMP_DIR}/${TAR_FILE}"
@@ -133,6 +104,8 @@ for SPLIT in train test; do
     echo "========================================"
     echo "Processing TAR $tar_id/$((NUM_TARS-1)): $TAR_FILE"
     echo "========================================"
+    
+    VIDEO_DIR="${TEMP_DIR}/videos_${TAR_NUM}"
     
     VIDEO_DIR="${TEMP_DIR}/videos_${TAR_NUM}"
     
@@ -207,62 +180,100 @@ for SPLIT in train test; do
         continue
     fi
     
-    # Step 3: Process videos into TFRecords
-    echo "=== STEP 3: Processing videos into TFRecords ==="
-    
-    # Calculate which batches contain videos from this tar
-    TOTAL_BATCHES=$(( (TOTAL_VIDEOS + BATCH_SIZE - 1) / BATCH_SIZE ))
-    
-    echo "Processing in batches of $BATCH_SIZE videos..."
-    echo "Total batches: $TOTAL_BATCHES"
-    echo ""
-    
-    # Process each batch
-    for ((batch=0; batch<TOTAL_BATCHES; batch++)); do
-        start_row=$((batch * BATCH_SIZE))
-        end_row=$((start_row + BATCH_SIZE))
+    # Process both train and test splits from the same extracted videos
+    for SPLIT in train test; do
+        echo ""
+        echo "###############################################"
+        echo "# Processing ${SPLIT^^} split from TAR $tar_id"
+        echo "###############################################"
+        echo ""
         
-        if [ $end_row -gt $TOTAL_VIDEOS ]; then
-            end_row=$TOTAL_VIDEOS
-        fi
+        OUTPUT_DIR="${WORK_DIR}/${SPLIT}_tfrecords_local"
+        CSV_FILE="${WORK_DIR}/PreProcessing/vggsound_${SPLIT}.csv"
         
-        # Include tar number in batch directory name to avoid conflicts
-        batch_id=$(printf "tar%02d_batch%03d" $tar_id $batch)
-        batch_output_dir="${OUTPUT_DIR}/${batch_id}"
-        
-        # Skip if batch already processed
-        if [ -f "${batch_output_dir}/.complete" ]; then
-            echo "  Batch $batch (rows $start_row-$end_row): Already complete, skipping"
+        # Count total videos in CSV (excluding header)
+        if [ ! -f "$CSV_FILE" ]; then
+            echo "ERROR: CSV file not found: $CSV_FILE"
+            echo "Skipping ${SPLIT} split..."
             continue
         fi
         
-        mkdir -p "$batch_output_dir"
+        TOTAL_VIDEOS=$(tail -n +2 "$CSV_FILE" | wc -l)
         
-        echo "  Processing batch $batch/$((TOTAL_BATCHES-1)) (rows $start_row-$end_row)..."
+        echo "Split: ${SPLIT}"
+        echo "Total videos in CSV: $TOTAL_VIDEOS"
+        echo "Output directory: $OUTPUT_DIR"
+        echo "CSV file: $CSV_FILE"
+        echo ""
         
-        # Run the Python preprocessing script with parallel workers
-        python PreProcessing/preprocess_vggsound_local.py \
-            --csv_file "$CSV_FILE" \
-            --video_dir "$VIDEO_DIR" \
-            --output_dir "$batch_output_dir" \
-            --start_row $start_row \
-            --end_row $end_row \
-            --split $SPLIT \
-            --num_workers $NUM_WORKERS 2>&1 | grep -E "Processing|Using|Created|ERROR|Warning|Processed" | tail -10 || true
+        # Create output directory
+        mkdir -p "$OUTPUT_DIR"
         
-        # Mark as complete if any tfrecords were created
-        if [ -n "$(find "$batch_output_dir" -name "*.tfrecord" 2>/dev/null)" ]; then
-            touch "${batch_output_dir}/.complete"
-            tfrecord_count=$(find "$batch_output_dir" -name "*.tfrecord" 2>/dev/null | wc -l)
-            echo "    ✓ Created $tfrecord_count TFRecord file(s)"
-        else
-            echo "    (no videos from this batch in current tar)"
-        fi
-    done
+        # Step 3: Process videos into TFRecords
+        echo "=== STEP 3: Processing videos into TFRecords for ${SPLIT} ==="
+        
+        # Calculate which batches contain videos from this tar
+        TOTAL_BATCHES=$(( (TOTAL_VIDEOS + BATCH_SIZE - 1) / BATCH_SIZE ))
+        
+        echo "Processing in batches of $BATCH_SIZE videos..."
+        echo "Total batches: $TOTAL_BATCHES"
+        echo ""
+        
+        # Process each batch
+        for ((batch=0; batch<TOTAL_BATCHES; batch++)); do
+            start_row=$((batch * BATCH_SIZE))
+            end_row=$((start_row + BATCH_SIZE))
+            
+            if [ $end_row -gt $TOTAL_VIDEOS ]; then
+                end_row=$TOTAL_VIDEOS
+            fi
+            
+            # Include tar number in batch directory name to avoid conflicts
+            batch_id=$(printf "tar%02d_batch%03d" $tar_id $batch)
+            batch_output_dir="${OUTPUT_DIR}/${batch_id}"
+            
+            # Skip if batch already processed
+            if [ -f "${batch_output_dir}/.complete" ]; then
+                echo "  Batch $batch (rows $start_row-$end_row): Already complete, skipping"
+                continue
+            fi
+            
+            mkdir -p "$batch_output_dir"
+            
+            echo "  Processing batch $batch/$((TOTAL_BATCHES-1)) (rows $start_row-$end_row)..."
+            
+            # Run the Python preprocessing script with parallel workers
+            python PreProcessing/preprocess_vggsound_local.py \
+                --csv_file "$CSV_FILE" \
+                --video_dir "$VIDEO_DIR" \
+                --output_dir "$batch_output_dir" \
+                --start_row $start_row \
+                --end_row $end_row \
+                --split $SPLIT \
+                --num_workers $NUM_WORKERS 2>&1 | grep -E "Processing|Using|Created|ERROR|Warning|Processed" | tail -10 || true
+            
+            # Mark as complete if any tfrecords were created
+            if [ -n "$(find "$batch_output_dir" -name "*.tfrecord" 2>/dev/null)" ]; then
+                touch "${batch_output_dir}/.complete"
+                tfrecord_count=$(find "$batch_output_dir" -name "*.tfrecord" 2>/dev/null | wc -l)
+                echo "    ✓ Created $tfrecord_count TFRecord file(s)"
+            else
+                echo "    (no videos from this batch in current tar)"
+            fi
+        done
+        
+        echo ""
+        echo "✓ Completed ${SPLIT} processing for tar $tar_id/$((NUM_TARS-1))"
+        
+        # Show progress for this split
+        completed_batches=$(find "$OUTPUT_DIR" -name ".complete" 2>/dev/null | wc -l)
+        echo "Overall progress for ${SPLIT}: $completed_batches/$TOTAL_BATCHES batches completed"
+        echo ""
+        
+    done  # End of split loop (train/test)
     
+    # Cleanup after processing both splits
     echo ""
-    
-    # Step 4: Cleanup
     echo "=== STEP 4: Cleanup ==="
     echo "Deleting extracted videos to save space..."
     rm -rf "$VIDEO_DIR"
@@ -273,33 +284,10 @@ for SPLIT in train test; do
     df -h "$WORK_DIR" | tail -1
     echo ""
     
-    echo "✓ Completed tar $tar_id/$((NUM_TARS-1))"
+    echo "✓ Completed all splits for tar $tar_id/$((NUM_TARS-1))"
     echo ""
-    
-    # Show progress
-    completed_batches=$(find "$OUTPUT_DIR" -name ".complete" 2>/dev/null | wc -l)
-    echo "Overall progress for ${SPLIT}: $completed_batches/$TOTAL_BATCHES batches completed"
-    echo ""
-done
 
-# Summary for this split
-echo ""
-echo "============================================"
-echo "${SPLIT^^} Split Complete!"
-echo "============================================"
-echo "TFRecords saved to: $OUTPUT_DIR"
-echo ""
-
-# Count completed batches
-completed_batches=$(find "$OUTPUT_DIR" -name ".complete" 2>/dev/null | wc -l)
-total_tfrecords=$(find "$OUTPUT_DIR" -name "*.tfrecord" 2>/dev/null | wc -l)
-
-echo "Statistics:"
-echo "  Completed batches: $completed_batches/$TOTAL_BATCHES"
-echo "  Total TFRecord files: $total_tfrecords"
-echo ""
-
-done  # End of train/test loop
+done  # End of tar loop
 
 # Final summary
 echo ""
