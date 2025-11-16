@@ -21,6 +21,7 @@ from typing import Any, Callable, Dict, Optional, Tuple, Union
 from absl import logging
 from clu import metric_writers
 from clu import periodic_actions
+from clu import platform
 from flax import jax_utils
 import flax.linen as nn
 import jax
@@ -144,7 +145,8 @@ def train_step(
   metrics_fn: MetricFn,
   config: ml_collections.ConfigDict,
   optimizer: Any,
-  debug: Optional[bool] = False
+  debug: Optional[bool] = False,
+  is_single_device: bool = False
 ) -> Tuple[train_utils.TrainState, Dict[str, Tuple[float, int]], float]:
   """Runs a single step of training.
 
@@ -228,7 +230,9 @@ def train_step(
     grad = clip_grads(grad, config.max_grad_norm)
 
   del train_cost
-  grad = jax.lax.pmean(grad, axis_name='batch')
+  # Average gradients across devices (skip on single GPU to avoid CUDA graph issues)
+  if not is_single_device:
+    grad = jax.lax.pmean(grad, axis_name='batch')
   updates, new_opt_state = optimizer.update(grad, train_state.opt_state, train_state.params)
   new_params = optimizers.optax.apply_updates(train_state.params, updates)
 
@@ -247,6 +251,10 @@ def train_step(
     batch['label'] = batch['label'][modality]
     metrics = metrics_fn(logits[modality], batch)
   else:
+    # When logits is not a dict but labels were converted to dict,
+    # extract the 'all' label which has all modalities' labels
+    if isinstance(batch['label'], dict):
+      batch['label'] = batch['label']['all']
     metrics = metrics_fn(logits, batch)
   new_train_state = train_state.replace(
       global_step=step + 1,
@@ -264,7 +272,8 @@ def eval_step(
     flax_model: nn.Module,
     metrics_fn: MetricFn,
     return_logits_and_labels: bool = False,
-    debug: Optional[bool] = False
+    debug: Optional[bool] = False,
+    is_single_device: bool = False
 ) -> Union[Tuple[Dict[str, Tuple[float, int]], jnp.ndarray, jnp.ndarray], Dict[
     str, Tuple[float, int]]]:
   """Runs a single step of training.
@@ -307,10 +316,19 @@ def eval_step(
       batch['inputs'],
       train=False, mutable=False, debug=debug)
 
+  # When logits is not a dict but labels were converted to dict,
+  # extract the 'all' label which has all modalities' labels
+  if not isinstance(logits, dict) and isinstance(batch['label'], dict):
+    batch['label'] = batch['label']['all']
+  
   metrics = metrics_fn(logits, batch)
   if return_logits_and_labels:
-    logits = jax.lax.all_gather(logits, 'batch')
-    labels = jax.lax.all_gather(batch['label'], 'batch')
+    # Skip all_gather on single GPU - data is already local
+    if not is_single_device:
+      logits = jax.lax.all_gather(logits, 'batch')
+      labels = jax.lax.all_gather(batch['label'], 'batch')
+    else:
+      labels = batch['label']
     return metrics, logits, labels
   return metrics
 
@@ -325,6 +343,7 @@ def test_step(
     return_logits_and_labels: bool = False,
     softmax_logits: bool = False,
     debug: bool = False,
+    is_single_device: bool = False,
 ) -> Union[
     Dict[str, Tuple[float, int]],
     Tuple[Dict[str, Tuple[float, int]], jnp.ndarray, jnp.ndarray],
@@ -362,6 +381,9 @@ def test_step(
     Calculated metrics [and optionally averaged logits that are of
     shape `[1, num_classes]`].
   """
+  # Handle dict labels - extract the 'all' label if labels is a dict
+  if isinstance(batch['label'], dict):
+    batch['label'] = batch['label']['all']
 
   all_logits = jnp.zeros(batch['label'].shape[1])
   assert len(batch['batch_mask'].shape) == 1, (
@@ -391,8 +413,12 @@ def test_step(
   batch['batch_mask'] = jnp.expand_dims(batch['batch_mask'][0], axis=0)
   metrics = metrics_fn(all_logits, batch)
   if return_logits_and_labels:
-    all_logits = jax.lax.all_gather(all_logits, 'batch')
-    labels = jax.lax.all_gather(batch['label'], 'batch')
+    # Skip all_gather on single GPU - data is already local
+    if not is_single_device:
+      all_logits = jax.lax.all_gather(all_logits, 'batch')
+      labels = jax.lax.all_gather(batch['label'], 'batch')
+    else:
+      labels = batch['label']
     return metrics, all_logits, labels
   return metrics
 
@@ -431,6 +457,14 @@ def train(
   # Build the loss_fn, metrics, and flax_model.
   model = model_cls(config, dataset.meta_data)
   is_multilabel_model = (config.model_name == 'mbt_multilabel_classification')
+  
+  # Detect single device for GPU optimization
+  num_local_devices = jax.local_device_count()
+  is_single_device = num_local_devices == 1
+  if is_single_device:
+    logging.info('Single device detected - optimizing collective operations for GPU')
+  else:
+    logging.info('Multi-device setup detected (%d devices)', num_local_devices)
 
   # Initialize model.
   rng, init_rng = jax.random.split(rng)
@@ -450,24 +484,30 @@ def train(
        config=config,
        rngs=init_rng)
 
+  # Get learning rate scheduler.
+  learning_rate_fn = lr_schedules.get_learning_rate_fn(config)
+
   # Create optimizer using Optax (train_lib).
-  optimizer = optimizers.get_optimizer(config, learning_rate_fn, params)
+  optimizer_config = optimizers.get_optax_optimizer_config(config)
+  optimizer = optimizers.get_optimizer(optimizer_config, learning_rate_fn, params)
   opt_state = optimizer.init(params)
   rng, train_rng = jax.random.split(rng)
   train_state = train_utils.TrainState(
-    global_step=0,
-    params=params,
-    opt_state=opt_state,
-    model_state=model_state,
-    rng=train_rng,
-    accum_train_time=0)
+      global_step=0,
+      tx=optimizer,
+      params=params,
+      opt_state=opt_state,
+      model_state=model_state,
+      rng=train_rng,
+      metadata={'accum_train_time': 0})
   start_step = train_state.global_step
   if config.checkpoint:
     train_state, start_step = train_utils.restore_checkpoint(
         workdir, train_state)
 
   if (start_step == 0  # Which means "no" checkpoint is restored!
-      and config.get('init_from') is not None):
+      and config.get('init_from') is not None
+      and config.init_from.get('checkpoint_path') is not None):
     restored_model_cfg = config.init_from.get('model_config')
     init_checkpoint_path = config.init_from.get('checkpoint_path')
     checkpoint_format = config.init_from.get('checkpoint_format', 'scenic')
@@ -495,15 +535,13 @@ def train(
     logging.info('Training completely from scratch.'
                  'Not restoring from any checkpoint.')
 
-  # Replicate the optimzier, state, and rng.
+  # Replicate the optimizer, state, and rng.
   train_state = jax_utils.replicate(train_state)
   del params  # Do not keep a copy of the initial params.
 
   # Calculate the total number of training steps.
   total_steps, steps_per_epoch = train_utils.get_num_training_steps(
       config, dataset.meta_data)
-  # Get learning rate scheduler.
-  learning_rate_fn = lr_schedules.get_learning_rate_fn(config)
 
   train_step_pmapped = jax.pmap(
     functools.partial(
@@ -514,7 +552,8 @@ def train(
       metrics_fn=model.get_metrics_fn('train'),
       config=config,
       optimizer=optimizer,
-      debug=config.debug_train),
+      debug=config.debug_train,
+      is_single_device=is_single_device),
     axis_name='batch',
     donate_argnums=(0, 1),
   )
@@ -524,10 +563,11 @@ def train(
           flax_model=model.flax_model,
           metrics_fn=model.get_metrics_fn('validation'),
           return_logits_and_labels=is_multilabel_model,
-          debug=config.debug_eval),
+          debug=config.debug_eval,
+          is_single_device=is_single_device),
       axis_name='batch',
-      # We can donate the eval_batch's buffer.
-      donate_argnums=(1,),
+      # Disable buffer donation for eval - can cause compilation issues with single device
+      # donate_argnums=(1,),
   )
   log_eval_steps = config.get('log_eval_steps') or steps_per_epoch
   log_test_steps = 0
@@ -542,7 +582,8 @@ def train(
             metrics_fn=model.get_metrics_fn('test'),
             n_clips=config.get('multicrop_clips_per_device', 2),
             return_logits_and_labels=is_multilabel_model,
-            debug=config.debug_eval),
+            debug=config.debug_eval,
+            is_single_device=is_single_device),
         axis_name='batch',
         # We can donate the test_batch's buffer.
         donate_argnums=(1,),
@@ -574,16 +615,27 @@ def train(
   train_metrics, extra_training_logs = [], []
   train_summary, eval_summary = None, None
 
-  chrono = train_utils.Chrono(
+  chrono = train_utils.Chrono()
+  chrono.load({'accum_train_time': int(jax_utils.unreplicate(train_state.metadata.get('accum_train_time', 0)))})
+  chrono.inform(
       first_step=start_step,
       total_steps=total_steps,
       steps_per_epoch=steps_per_epoch,
-      global_bs=config.batch_size,
-      accum_train_time=int(jax_utils.unreplicate(train_state.accum_train_time)))
+      global_bs=config.batch_size)
 
   logging.info('Starting training loop at step %d.', start_step + 1)
+  print(f'\n{"="*80}')
+  print(f'Starting training: {total_steps} total steps, {steps_per_epoch} steps per epoch')
+  print(f'Batch size: {config.batch_size}, Eval every {log_eval_steps} steps')
+  print(f'{"="*80}\n')
+  
   report_progress = periodic_actions.ReportProgress(
       num_train_steps=total_steps, writer=writer)
+  
+  def write_note(note):
+    if lead_host:
+      platform.work_unit().set_notes(note)
+  
   hooks = []
   if lead_host:
     hooks.append(report_progress)
@@ -596,10 +648,52 @@ def train(
       step0_log['gflops'] = gflops
     writer.write_scalars(1, step0_log)
 
+  # Timing instrumentation for bottleneck analysis
+  import time
+  timing_stats = {
+      'data_loading': [],
+      'train_step_total': [],
+      'train_step_compile': [],
+      'eval_total': [],
+      'checkpoint': [],
+  }
+  first_train_step = True
+
   for step in range(start_step + 1, total_steps + 1):
     with jax.profiler.StepTraceAnnotation('train', step_num=step):
+      # Time data loading
+      t0_data = time.time()
       train_batch = next(dataset.train_iter)
+      t1_data = time.time()
+      timing_stats['data_loading'].append(t1_data - t0_data)
+      
+      # Time train step (including first-step compilation)
+      t0_train = time.time()
       train_state, t_metrics, lr = train_step_pmapped(train_state, train_batch)
+      # Sync to ensure computation is complete
+      jax.tree_util.tree_map(lambda x: x.block_until_ready(), t_metrics)
+      t1_train = time.time()
+      
+      if first_train_step:
+        timing_stats['train_step_compile'].append(t1_train - t0_train)
+        first_train_step = False
+        print(f'\n[TIMING] First train_step (with compilation): {t1_train - t0_train:.2f}s')
+      else:
+        timing_stats['train_step_total'].append(t1_train - t0_train)
+      
+      # Print progress to terminal every step for visibility
+      if step % 10 == 0 or step <= 5:
+        print(f'Step {step}/{total_steps} completed', flush=True)
+      
+      # Log timing stats every 20 steps
+      if step % 20 == 0 and len(timing_stats['data_loading']) > 0:
+        avg_data = np.mean(timing_stats['data_loading'][-20:])
+        avg_train = np.mean(timing_stats['train_step_total'][-20:]) if len(timing_stats['train_step_total']) > 0 else 0
+        total_step_time = avg_data + avg_train
+        data_pct = (avg_data / total_step_time * 100) if total_step_time > 0 else 0
+        train_pct = (avg_train / total_step_time * 100) if total_step_time > 0 else 0
+        print(f'\n[TIMING Step {step}] Data: {avg_data:.3f}s ({data_pct:.1f}%), Train: {avg_train:.3f}s ({train_pct:.1f}%), Total: {total_step_time:.3f}s', flush=True)
+      
       # This will accumulate metrics in TPU memory up to the point that we log
       # them. This is no problem for small metrics but may be a problem for
       # large (e.g. segmentation) metrics. An alternative is to set
@@ -618,7 +712,7 @@ def train(
     ###################### LOG TRAIN SUMMARY ########################
     if (step % log_summary_steps == 1) or (step == total_steps):
       if lead_host:
-        chrono.tick(step, writer=writer)
+        chrono.tick(step, writer=writer, write_note=write_note)
       train_summary = train_utils.log_train_summary(
           step=step,
           train_metrics=jax.tree_util.tree_map(train_utils.unreplicate_and_get,
@@ -627,53 +721,130 @@ def train(
               train_utils.unreplicate_and_get, extra_training_logs),
           writer=writer,
           key_separator='/')
+      
+      # Print training metrics to terminal
+      if train_summary:
+        metrics_str = ', '.join([f'{k}: {v:.4f}' for k, v in train_summary.items() if isinstance(v, (int, float))])
+        print(f'\n[Step {step}] Training metrics: {metrics_str}', flush=True)
+      
       # Reset metric accumulation for next evaluation cycle.
       train_metrics, extra_training_logs = [], []
 
     ################### EVALUATION ################################
-    if (step % log_eval_steps == 1) or (step == total_steps):
+    # Only run eval at log_eval_steps intervals and at the final step (skip step 1)
+    if ((step % log_eval_steps == 0 and step > 0) or (step == total_steps)):
+      print(f'\n[Step {step}] Starting evaluation...', flush=True)
+      t0_eval = time.time()
       with report_progress.timed('eval'):
-        eval_metrics = []
-        additional_summary = None
-        if is_multilabel_model:
-          eval_logits = []
-          eval_labels = []
-          n_classes = dataset.meta_data['num_classes']
-        # Sync model state across replicas.
-        train_state = train_utils.sync_model_state_across_replicas(train_state)
-        for _ in range(steps_per_eval):
-          eval_batch = next(dataset.valid_iter)
-          e_metrics = eval_step_pmapped(train_state, eval_batch)
+        try:
+          print('[Eval] Initializing eval metrics lists...', flush=True)
+          eval_metrics = []
+          additional_summary = None
           if is_multilabel_model:
-            e_metrics, logits_batch, labels_batch = e_metrics
-            eval_logits.append(vivit_train_utils.to_cpu(logits_batch))
-            eval_labels.append(vivit_train_utils.to_cpu(labels_batch))
-          # Fetch e_metrics to host and store.
-          eval_metrics.append(train_utils.unreplicate_and_get(e_metrics))
-        if is_multilabel_model:
-          additional_summary = evaluation_lib.compute_mean_average_precision(
-              np.concatenate(eval_logits, axis=0),
-              np.concatenate(eval_labels, axis=0),
-              return_per_class_ap=n_classes < 10)
-        # Log eval summary.
-        eval_summary = train_utils.log_eval_summary(
-            step=step,
-            eval_metrics=eval_metrics,
-            extra_eval_summary=additional_summary,
-            writer=writer,
-            key_separator='/')
+            eval_logits = []
+            eval_labels = []
+            n_classes = dataset.meta_data['num_classes']
+          
+          # Sync model state across replicas (skip on single device).
+          print(f'[Eval] Syncing model state (single_device={is_single_device})...', flush=True)
+          if not is_single_device:
+            train_state = train_utils.sync_model_state_across_replicas(train_state)
+          print(f'[Eval] Model state sync complete. Starting {steps_per_eval} eval steps...', flush=True)
+          
+          for eval_step_idx in range(steps_per_eval):
+            if eval_step_idx % 10 == 0 or eval_step_idx < 3:
+              print(f'[Eval] Step {eval_step_idx+1}/{steps_per_eval} - Getting batch...', flush=True)
+            eval_batch = next(dataset.valid_iter)
+            
+            if eval_step_idx < 3:
+              print(f'[Eval] Step {eval_step_idx+1}/{steps_per_eval} - Batch received, running eval_step_pmapped...', flush=True)
+            
+            # Try eval step, catch CUDA graph errors and retry
+            try:
+              e_metrics = eval_step_pmapped(train_state, eval_batch)
+            except (ValueError, RuntimeError) as e:
+              error_msg = str(e)
+              if 'CaptureGpuGraph' in error_msg or 'xla.gpu.graph.launch' in error_msg or 'CUDA_ERROR_STREAM_CAPTURE_INVALIDATED' in error_msg:
+                logging.warning('Eval: CUDA graph capture failed, retrying with normal execution.')
+                print('[Eval] CUDA graph error, retrying...', flush=True)
+                # Retry - JAX will fall back to normal execution
+                e_metrics = eval_step_pmapped(train_state, eval_batch)
+              else:
+                raise
+            
+            if eval_step_idx < 3:
+              print(f'[Eval] Step {eval_step_idx+1}/{steps_per_eval} - eval_step_pmapped complete', flush=True)
+            
+            if is_multilabel_model:
+              e_metrics, logits_batch, labels_batch = e_metrics
+              eval_logits.append(vivit_train_utils.to_cpu(logits_batch))
+              eval_labels.append(vivit_train_utils.to_cpu(labels_batch))
+            
+            # Fetch e_metrics to host and store.
+            eval_metrics.append(train_utils.unreplicate_and_get(e_metrics))
+            
+            if eval_step_idx < 3:
+              print(f'[Eval] Step {eval_step_idx+1}/{steps_per_eval} - Metrics stored', flush=True)
+          
+          print(f'[Eval] All {steps_per_eval} eval steps completed', flush=True)
+        except (ValueError, RuntimeError) as e:
+          # Catch any other errors during eval
+          logging.error('Evaluation failed with error: %s', str(e))
+          print(f'[Eval] ERROR: {str(e)}', flush=True)
+          eval_metrics = []
+        
+        t1_eval = time.time()
+        timing_stats['eval_total'].append(t1_eval - t0_eval)
+        print(f'[TIMING] Evaluation took {t1_eval - t0_eval:.2f}s', flush=True)
+        
+        # Only log eval summary if we have metrics
+        print('[Eval] Processing results and logging summary...', flush=True)
+        if eval_metrics:
+          if is_multilabel_model:
+            print('[Eval] Computing mean average precision...', flush=True)
+            additional_summary = evaluation_lib.compute_mean_average_precision(
+                np.concatenate(eval_logits, axis=0),
+                np.concatenate(eval_labels, axis=0),
+                return_per_class_ap=n_classes < 10)
+          # Log eval summary.
+          print('[Eval] Logging eval summary...', flush=True)
+          eval_summary = train_utils.log_eval_summary(
+              step=step,
+              eval_metrics=eval_metrics,
+              extra_eval_summary=additional_summary,
+              writer=writer,
+              key_separator='/')
+          
+          # Print eval metrics to terminal
+          if eval_summary:
+            metrics_str = ', '.join([f'{k}: {v:.4f}' for k, v in eval_summary.items() if isinstance(v, (int, float))])
+            print(f'[Step {step}] Eval metrics: {metrics_str}', flush=True)
+        else:
+          logging.info('Skipped logging eval summary due to eval error.')
+          print(f'[Step {step}] Evaluation skipped due to error', flush=True)
+        print('[Eval] Flushing writer...', flush=True)
         writer.flush()
+        print('[Eval] Cleaning up...', flush=True)
         del eval_metrics
+        print('[Eval] Complete!\n', flush=True)
     ##################### CHECKPOINTING ###########################
     if ((step % checkpoint_steps == 0 and step > 0) or (step == total_steps) or
         (step % log_eval_steps == 1)) and config.checkpoint:
+      print(f'[Step {step}] Saving checkpoint...', flush=True)
+      t0_ckpt = time.time()
       with report_progress.timed('checkpoint'):
-        # Sync model state across replicas.
-        train_state = train_utils.sync_model_state_across_replicas(train_state)
+        # Sync model state across replicas (skip on single device).
+        if not is_single_device:
+          train_state = train_utils.sync_model_state_across_replicas(train_state)
         if lead_host:
-          train_state.replace(  # pytype: disable=attribute-error
-              accum_train_time=chrono.accum_train_time)
+          # Update accum_train_time in metadata before checkpointing
+          updated_metadata = train_state.metadata.copy() if train_state.metadata else {}
+          updated_metadata['accum_train_time'] = chrono.accum_train_time
+          train_state = train_state.replace(metadata=updated_metadata)
           train_utils.save_checkpoint(workdir, train_state)
+      t1_ckpt = time.time()
+      timing_stats['checkpoint'].append(t1_ckpt - t0_ckpt)
+      print(f'[TIMING] Checkpoint took {t1_ckpt - t0_ckpt:.2f}s', flush=True)
 
     ############# MULTICROP TESTING ############################
     if (config.dataset_configs.get('do_multicrop_test') and
@@ -685,8 +856,9 @@ def train(
           test_logits = []
           test_labels = []
           n_classes = dataset.meta_data['num_classes']
-        # Sync model state across replicas.
-        train_state = train_utils.sync_model_state_across_replicas(train_state)
+        # Sync model state across replicas (skip on single device).
+        if not is_single_device:
+          train_state = train_utils.sync_model_state_across_replicas(train_state)
 
         # At the end of training, evaluate on the whole test set.
         if step == total_steps:
@@ -723,7 +895,59 @@ def train(
         del test_metrics
 
     chrono.resume()  # un-pause now
+  
   # Wait until computations are done before exiting.
   train_utils.barrier_across_hosts()
+  
+  print(f'\n{"="*80}')
+  print(f'Training completed! Total steps: {total_steps}')
+  print(f'{"="*80}\n')
+  
+  # Print comprehensive timing analysis
+  if len(timing_stats['data_loading']) > 10:
+    print(f'\n{"="*80}')
+    print('TIMING ANALYSIS SUMMARY')
+    print(f'{"="*80}')
+    
+    avg_data = np.mean(timing_stats['data_loading'])
+    avg_train = np.mean(timing_stats['train_step_total']) if len(timing_stats['train_step_total']) > 0 else 0
+    total_per_step = avg_data + avg_train
+    
+    print(f'\nPer-Step Breakdown (averaged over {len(timing_stats["train_step_total"])} steps):')
+    print(f'  Data Loading:    {avg_data:.4f}s ({avg_data/total_per_step*100:.1f}%)')
+    print(f'  Train Step:      {avg_train:.4f}s ({avg_train/total_per_step*100:.1f}%)')
+    print(f'  Total per step:  {total_per_step:.4f}s')
+    print(f'  Steps/sec:       {1/total_per_step:.2f}')
+    
+    if timing_stats['train_step_compile']:
+      print(f'\nFirst Step (with compilation): {timing_stats["train_step_compile"][0]:.2f}s')
+    
+    if timing_stats['eval_total']:
+      avg_eval = np.mean(timing_stats['eval_total'])
+      print(f'\nEvaluation (avg):  {avg_eval:.2f}s')
+    
+    if timing_stats['checkpoint']:
+      avg_ckpt = np.mean(timing_stats['checkpoint'])
+      print(f'Checkpointing (avg): {avg_ckpt:.2f}s')
+    
+    print(f'\nBottleneck Analysis:')
+    if avg_data > avg_train:
+      pct_slower = (avg_data / avg_train - 1) * 100
+      print(f'  ⚠️  DATA LOADING is the bottleneck ({pct_slower:.1f}% slower than train_step)')
+      print(f'  Recommendations:')
+      print(f'    - Increase prefetch_to_device (current: check config)')
+      print(f'    - Increase prefetch_to_host (current: check config)')
+      print(f'    - Reduce data augmentation complexity')
+      print(f'    - Use faster storage (SSD vs HDD)')
+    else:
+      pct_slower = (avg_train / avg_data - 1) * 100
+      print(f'  ⚠️  TRAIN STEP is the bottleneck ({pct_slower:.1f}% slower than data loading)')
+      print(f'  Recommendations:')
+      print(f'    - Increase batch size if memory allows')
+      print(f'    - Use mixed precision training (bf16/fp16)')
+      print(f'    - Profile GPU compute with JAX profiler')
+    
+    print(f'{"="*80}\n')
+  
   # Return the train and eval summary after last step for regression testing.
   return train_state, train_summary, eval_summary

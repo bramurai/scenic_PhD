@@ -1,0 +1,11 @@
+name: scenic_phd
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9.24
+  - cudatoolkit=11.8.0
+  - cudnn=8.9.7.29
+  - pip
+  - setuptools
+  - wheel

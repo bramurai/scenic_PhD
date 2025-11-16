@@ -306,15 +306,34 @@ def create_sequence_example(video_path: str, start_time: float, end_time: float,
                 log_mel_spec = compute_log_mel_spectrogram(
                     audio, audio_sample_rate, n_mels, win_length_ms, hop_length_ms)
                 
-                # Store spectrogram as a sequence of float features
-                # Shape: (time_frames, n_mels) -> flatten each time frame
+                # Store spectrogram as chunks of (100, n_mels) instead of (1, n_mels)
+                # This matches the MBT config expectation of spec_shape=(100, 128)
+                chunk_size = 100
+                total_frames = log_mel_spec.shape[0]
+                
+                # Reshape into chunks of 100 frames
+                # Pad if necessary to make divisible by chunk_size
+                num_chunks = int(np.ceil(total_frames / chunk_size))
+                padded_length = num_chunks * chunk_size
+                
+                if padded_length > total_frames:
+                    # Pad with zeros
+                    padding = np.zeros((padded_length - total_frames, n_mels), dtype=log_mel_spec.dtype)
+                    log_mel_spec = np.vstack([log_mel_spec, padding])
+                
+                # Reshape to (num_chunks, chunk_size, n_mels)
+                log_mel_spec_chunked = log_mel_spec.reshape(num_chunks, chunk_size, n_mels)
+                
+                # Store each chunk as a flat feature
                 spec_list = []
-                for spec_frame in log_mel_spec:
-                    spec_list.append(create_float_feature(spec_frame.tolist()))
+                for chunk in log_mel_spec_chunked:
+                    # Flatten the chunk: (100, 128) -> (12800,)
+                    spec_list.append(create_float_feature(chunk.flatten().tolist()))
                 
                 feature_lists['WAVEFORM/feature/floats'] = tf.train.FeatureList(feature=spec_list)
                 context_dict['WAVEFORM/num_mel_bins'] = create_int64_feature(n_mels)
                 context_dict['WAVEFORM/sample_rate'] = create_int64_feature(audio_sample_rate)
+                context_dict['WAVEFORM/chunk_size'] = create_int64_feature(chunk_size)
                 
             except Exception as e:
                 logging.warning(f"Error computing spectrogram for {video_path}: {e}")
