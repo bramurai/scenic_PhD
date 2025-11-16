@@ -92,7 +92,7 @@ def get_config():
   config.dataset_configs.do_multicrop_test = True
   config.dataset_configs.log_test_epochs = 4
   config.dataset_configs.num_test_clips = 4
-  config.dataset_configs.test_batch_size = 8
+  config.dataset_configs.test_batch_size = 1 #Needs to be nr of local devices (So 1!!)
   config.multicrop_clips_per_device = 2
 
   # Data augmentation
