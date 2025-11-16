@@ -58,7 +58,7 @@ def get_config():
   # Match the preprocessing from training
   config.dataset_configs.num_frames = 8
   config.dataset_configs.stride = 8
-  config.dataset_configs.num_spec_frames = 800  # Match VGGSound training config
+  config.dataset_configs.num_spec_frames = 8  # Number of spectrogram chunks (each chunk is 100x128)
   config.dataset_configs.spec_stride = 1
 
   # These statistics were calculated over the entire unbalanced train set.
@@ -169,7 +169,7 @@ def get_config():
   config.init_from.model_config = None
  
   # Point to your trained checkpoint for inference
-  config.init_from.checkpoint_path = 'mbt_base'  # Path to trained model checkpoint
+  config.init_from.checkpoint_path = '/home/labuta/Documents/Bram/scenic_PhD/CheckPoints/MBT_AV'  # Path to VIT model checkpoint
   config.init_from.checkpoint_format = 'scenic'
   config.init_from.model_config = ml_collections.ConfigDict()
   config.init_from.model_config.model = ml_collections.ConfigDict()

@@ -178,7 +178,7 @@ def get_config():
 
   # Pre-trained weights initialization
   config.init_from = ml_collections.ConfigDict()
-  config.init_from.model_config = None
+  config.init_from.model_config = None 
   config.init_from.checkpoint_path = "/home/labuta/Documents/Bram/scenic_PhD/CheckPoints/ViT_B_16_ImageNet1k_dir"  # Set to pretrained ViT path if available
   config.init_from.checkpoint_format = 'scenic'
   config.init_from.model_config = ml_collections.ConfigDict()

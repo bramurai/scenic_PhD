@@ -15,13 +15,14 @@ set -e  # Exit on any error
 
 # Configuration
 START_TAR=${1:-0}  # Which tar file to start from (0-19)
-BATCH_SIZE=2000
+BATCH_SIZE=3000
 NUM_TARS=20
 NUM_WORKERS=24  # Number of parallel workers for video processing
 
 # Paths
 WORK_DIR="$(pwd)"
 TEMP_DIR="${WORK_DIR}/vggsound_temp"
+STORAGE_BASE="/media/labuta/7f1ad7d2-a1d3-4a1f-ae81-7cb5dd2661a3/VGG_Preprocessed"
 
 # HuggingFace dataset URL
 BASE_URL="https://huggingface.co/datasets/Loie/VGGSound/resolve/main"
@@ -188,7 +189,7 @@ for ((tar_id=START_TAR; tar_id<NUM_TARS; tar_id++)); do
         echo "###############################################"
         echo ""
         
-        OUTPUT_DIR="${WORK_DIR}/${SPLIT}_tfrecords_local"
+        OUTPUT_DIR="${STORAGE_BASE}/${SPLIT}_tfrecords_local"
         CSV_FILE="${WORK_DIR}/PreProcessing/vggsound_${SPLIT}.csv"
         
         # Count total videos in CSV (excluding header)
@@ -297,7 +298,7 @@ echo "============================================"
 
 # Summary for both splits
 for SPLIT in train test; do
-    OUTPUT_DIR="${WORK_DIR}/${SPLIT}_tfrecords_local"
+    OUTPUT_DIR="${STORAGE_BASE}/${SPLIT}_tfrecords_local"
     if [ -d "$OUTPUT_DIR" ]; then
         completed_batches=$(find "$OUTPUT_DIR" -name ".complete" 2>/dev/null | wc -l)
         total_tfrecords=$(find "$OUTPUT_DIR" -name "*.tfrecord" 2>/dev/null | wc -l)
