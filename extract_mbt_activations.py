@@ -18,7 +18,7 @@ Usage:
 
 import os
 import pickle
-from typing import Dict, Any
+from typing import Dict, Any, Tuple
 from absl import app, flags, logging
 import jax
 import jax.numpy as jnp
@@ -119,51 +119,28 @@ def create_test_dataset(config: ml_collections.ConfigDict):
       augmentation_params=None,
   )
   
+  # Apply post-processing transformations (map_keys, etc.)
+  from scenic.dataset_lib import dataset_utils
+  return_as_dict = config.dataset_configs.get('return_as_dict', True)
+  
+  dataset_iter = iter(dataset)
+  dataset_iter = map(dataset_utils.tf_to_numpy, dataset_iter)
+  dataset_iter = map(
+      functools.partial(
+          audiovisual_tfrecord_dataset.map_keys, 
+          modalities=('spectrogram', 'rgb'), 
+          return_as_dict=return_as_dict),
+      dataset_iter)
+  
   logging.info(f'Dataset created with {num_examples} examples')
-  return dataset, num_examples
+  return dataset_iter, num_examples
 
 
 def load_checkpoint(config: ml_collections.ConfigDict, checkpoint_dir: str):
   """Load trained MBT checkpoint."""
   logging.info(f'Loading checkpoint from {checkpoint_dir}...')
   
-  # Create model
-  model_cls = mbt_model.MBTMultilabelClassificationModel
-  
-  # Spectrogram shape: num_spec_frames chunks are concatenated along time dimension
-  spec_time_dim = config.dataset_configs.num_spec_frames * config.dataset_configs.spec_shape[0]
-  
-  model_instance = model_cls(config, {
-      'num_classes': config.dataset_configs.num_classes,
-      'input_shape': {
-          'rgb': (-1, config.dataset_configs.num_frames, 224, 224, 3),
-          'spectrogram': (-1, spec_time_dim, config.dataset_configs.spec_shape[1], 3)
-      },
-      'input_dtype': jnp.float32,
-      'target_is_onehot': True
-  })
-  
-  # Initialize model
-  rng = jax.random.PRNGKey(0)
-  init_rng, rng = jax.random.split(rng)
-  
-  # Dummy input for initialization
-  # Spectrogram shape is (batch, num_spec_frames * spec_shape[0], spec_shape[1], 3)
-  # The chunks are concatenated along the time dimension
-  spec_time_dim = config.dataset_configs.num_spec_frames * config.dataset_configs.spec_shape[0]
-  dummy_input = {
-      'rgb': jnp.zeros((1, config.dataset_configs.num_frames, 224, 224, 3)),
-      'spectrogram': jnp.zeros((1, spec_time_dim, config.dataset_configs.spec_shape[1], 3))
-  }
-  
-  # Initialize
-  variables = model_instance.flax_model.init(
-      init_rng,
-      dummy_input,
-      train=False
-  )
-  
-  # Load checkpoint
+  # Load checkpoint first
   # Check if checkpoint_dir is actually a file (for single checkpoint files)
   if os.path.isfile(checkpoint_dir):
     logging.info(f'Loading checkpoint file: {checkpoint_dir}')
@@ -199,10 +176,81 @@ def load_checkpoint(config: ml_collections.ConfigDict, checkpoint_dir: str):
   else:
     params = checkpoint_path
   
-  model_state = variables.get('batch_stats', {})
+  # Create model (no initialization needed, we have params from checkpoint)
+  model_cls = mbt_model.MBTMultilabelClassificationModel
+  
+  # Spectrogram shape: num_spec_frames chunks are concatenated along time dimension
+  spec_time_dim = config.dataset_configs.num_spec_frames * config.dataset_configs.spec_shape[0]
+  
+  model_instance = model_cls(config, {
+      'num_classes': config.dataset_configs.num_classes,
+      'input_shape': {
+          'rgb': (-1, config.dataset_configs.num_frames, 224, 224, 3),
+          'spectrogram': (-1, spec_time_dim, config.dataset_configs.spec_shape[1], 3)
+      },
+      'input_dtype': jnp.float32,
+      'target_is_onehot': True
+  })
+  
+  model_state = {}  # No batch_stats needed for inference
+  rng = jax.random.PRNGKey(0)
   
   logging.info('Checkpoint loaded successfully')
   return model_instance, params, model_state, rng
+
+
+def compute_attention_weights(activations: Dict) -> Dict:
+  """Compute attention weights from query and key activations.
+  
+  For each attention layer, compute:
+    attention_weights = softmax(Q @ K^T / sqrt(d_k))
+    
+  where Q and K are the query and key tensors.
+  """
+  attention_weights = {}
+  
+  # Find all attention layers by looking for query/key pairs
+  attention_layers = {}
+  for key in activations.keys():
+    if 'MultiHeadDotProductAttention' in key:
+      # Extract base name (remove _query, _key, _value, etc.)
+      base_name = key.rsplit('_', 2)[0] if key.endswith(('_query___call___0', '_key___call___0', '_value___call___0')) else None
+      if base_name and base_name not in attention_layers:
+        attention_layers[base_name] = {}
+      
+      if base_name:
+        if key.endswith('_query___call___0'):
+          attention_layers[base_name]['query'] = activations[key]
+        elif key.endswith('_key___call___0'):
+          attention_layers[base_name]['key'] = activations[key]
+  
+  # Compute attention weights for each layer
+  for layer_name, qk_dict in attention_layers.items():
+    if 'query' in qk_dict and 'key' in qk_dict:
+      Q = qk_dict['query']  # Shape: (batch, seq_len, num_heads, head_dim)
+      K = qk_dict['key']    # Shape: (batch, seq_len, num_heads, head_dim)
+      
+      # Transpose for attention computation
+      # Q: (batch, num_heads, seq_len, head_dim)
+      # K: (batch, num_heads, head_dim, seq_len)
+      Q_t = np.transpose(Q, (0, 2, 1, 3))
+      K_t = np.transpose(K, (0, 2, 3, 1))
+      
+      # Compute attention scores: Q @ K^T / sqrt(d_k)
+      head_dim = Q.shape[-1]
+      scores = np.matmul(Q_t, K_t) / np.sqrt(head_dim)
+      
+      # Apply softmax
+      # Subtract max for numerical stability
+      scores_max = np.max(scores, axis=-1, keepdims=True)
+      exp_scores = np.exp(scores - scores_max)
+      attention = exp_scores / np.sum(exp_scores, axis=-1, keepdims=True)
+      
+      # Save with a clean name
+      clean_name = layer_name.replace('activation_', '')
+      attention_weights[f'attention_weights_{clean_name}'] = attention
+  
+  return attention_weights
 
 
 def extract_with_intermediates(model_instance, params, model_state, inputs):
@@ -230,18 +278,46 @@ def extract_with_intermediates(model_instance, params, model_state, inputs):
   activations = {}
   attention_weights = {}
   
+  def extract_from_dict(d, prefix='', depth=0):
+    """Recursively extract arrays from nested FrozenDicts."""
+    if depth == 0:
+      logging.info("Exploring intermediates structure...")
+    
+    # Check if it's dict-like (has items()) or tuple-like
+    has_items = hasattr(d, 'items')
+    is_tuple = isinstance(d, tuple)
+    
+    if has_items or is_tuple:
+      items = d.items() if has_items else enumerate(d)
+      for key, value in items:
+        new_prefix = f"{prefix}/{key}" if prefix else str(key)
+        
+        # Log what we're seeing
+        if depth < 3:  # Only log first few levels
+          logging.info(f"{'  ' * depth}{new_prefix}: {type(value).__name__}")
+        
+        if hasattr(value, 'shape'):
+          # It's an array
+          activations[new_prefix] = np.array(value)
+          logging.info(f"✓ Captured activation: {new_prefix}, shape={value.shape}")
+        else:
+          # Recurse into nested structure
+          extract_from_dict(value, new_prefix, depth + 1)
+  
   if 'intermediates' in state:
-    for key, value in state['intermediates'].items():
-      layer_name = str(key)
-      
-      # Store activation
-      if hasattr(value, 'shape'):
-        activations[layer_name] = np.array(value)
-      
-      # Check if this is an attention layer (contains attention weights)
-      if 'attention' in layer_name.lower() or 'attn' in layer_name.lower():
-        if isinstance(value, dict) and 'attention_weights' in value:
-          attention_weights[layer_name] = np.array(value['attention_weights'])
+    intermediates = state['intermediates']
+    logging.info(f"Found intermediates: type={type(intermediates)}, len={len(intermediates) if hasattr(intermediates, '__len__') else 'N/A'}")
+    logging.info(f"Intermediates repr (first 500 chars): {str(intermediates)[:500]}")
+    
+    extract_from_dict(intermediates)
+    logging.info(f"Total activations captured: {len(activations)}")
+    
+    # Compute attention weights from query and key activations
+    logging.info("Computing attention weights from Q and K...")
+    attention_weights = compute_attention_weights(activations)
+    logging.info(f"Computed {len(attention_weights)} attention weight matrices")
+  else:
+    logging.warning("No intermediates found in state!")
   
   return {
       'logits': np.array(output),
@@ -250,9 +326,142 @@ def extract_with_intermediates(model_instance, params, model_state, inputs):
   }
 
 
+def filter_essential_activations(activations: Dict, attention_weights: Dict) -> Tuple[Dict, Dict, Dict]:
+  """Filter to keep only essential activations.
+  
+  Keeps:
+    1. Final output of each encoder block (24 total: 12 RGB + 12 Audio)
+    2. Bottleneck tokens (from layers 8-11)
+    3. Full attention weight matrices (24 total)
+  
+  Returns:
+    (encoder_outputs, bottleneck_tokens, attention_matrices)
+  """
+  encoder_outputs = {}
+  bottleneck_tokens = {}
+  attention_matrices = {}
+  
+  logging.info("\nFiltering essential activations...")
+  
+  # Pattern for final encoder block outputs
+  # Keys look like: "Transformer/encoderblock_0/MlpBlock_0/__call__/0"
+  # Or: "Transformer/encoderblock_0_spectrogram/MlpBlock_0/__call__/0"
+  for key, value in activations.items():
+    if 'encoderblock_' in key and 'MlpBlock_0/__call__/0' in key and 'Transformer' in key:
+      # Extract layer number - key format: "Transformer/encoderblock_10_spectrogram/MlpBlock..."
+      # or "Transformer/encoderblock_10/MlpBlock..."
+      parts = key.split('/')
+      for part in parts:
+        if part.startswith('encoderblock_'):
+          # Extract layer number and check for spectrogram
+          if '_spectrogram' in part:
+            layer_num = part.replace('encoderblock_', '').replace('_spectrogram', '')
+            name = f'encoder_block_L{layer_num}_audio_output'
+          else:
+            layer_num = part.replace('encoderblock_', '')
+            name = f'encoder_block_L{layer_num}_rgb_output'
+          encoder_outputs[name] = value
+          logging.info(f"  Found {name}: shape {value.shape}")
+          break
+  
+  # Extract bottleneck tokens from fused sequences (layers 8-11)
+  # The bottleneck tokens are the last 5 tokens in the sequence for layers >= 8
+  for key, value in activations.items():
+    if 'encoderblock_' in key and 'MlpBlock_0/__call__/0' in key and 'Transformer' in key:
+      parts = key.split('/')
+      for part in parts:
+        if part.startswith('encoderblock_'):
+          # Extract layer number
+          if '_spectrogram' in part:
+            layer_num_str = part.replace('encoderblock_', '').replace('_spectrogram', '')
+            try:
+              layer_num = int(layer_num_str)
+              if layer_num >= 8:
+                bottleneck_tokens[f'bottleneck_L{layer_num}_audio'] = value[:, -5:, :]
+                logging.info(f"  Extracted bottleneck_L{layer_num}_audio: shape {value[:, -5:, :].shape}")
+            except ValueError:
+              pass
+          else:
+            layer_num_str = part.replace('encoderblock_', '')
+            try:
+              layer_num = int(layer_num_str)
+              if layer_num >= 8:
+                bottleneck_tokens[f'bottleneck_L{layer_num}_rgb'] = value[:, -5:, :]
+                logging.info(f"  Extracted bottleneck_L{layer_num}_rgb: shape {value[:, -5:, :].shape}")
+            except ValueError:
+              pass
+          break
+  
+  # Compute attention weights for each encoder block
+  logging.info("\nComputing attention weights for encoder blocks...")
+  attention_layers = {}
+  
+  # Find query and key for each attention layer
+  # Pattern: "Transformer/encoderblock_10/MultiHeadDotProductAttention_0/query/__call__/0"
+  for key in activations.keys():
+    if 'MultiHeadDotProductAttention' in key and 'encoderblock_' in key and 'Transformer' in key:
+      # Extract base layer identifier from path
+      parts = key.split('/')
+      for part in parts:
+        if part.startswith('encoderblock_'):
+          base_name = part  # e.g., "encoderblock_10" or "encoderblock_10_spectrogram"
+          if base_name not in attention_layers:
+            attention_layers[base_name] = {}
+          
+          if '/query/__call__/0' in key:
+            attention_layers[base_name]['query'] = activations[key]
+          elif '/key/__call__/0' in key:
+            attention_layers[base_name]['key'] = activations[key]
+          break
+  
+  # Compute attention weights from Q and K
+  for layer_name, qk_dict in attention_layers.items():
+    if 'query' in qk_dict and 'key' in qk_dict:
+      Q = qk_dict['query']  # Shape: (batch, seq_len, num_heads, head_dim)
+      K = qk_dict['key']    # Shape: (batch, seq_len, num_heads, head_dim)
+      
+      # Transpose for attention computation
+      Q_t = np.transpose(Q, (0, 2, 1, 3))  # (batch, num_heads, seq_len, head_dim)
+      K_t = np.transpose(K, (0, 2, 3, 1))  # (batch, num_heads, head_dim, seq_len)
+      
+      # Compute attention: softmax(Q @ K^T / sqrt(d_k))
+      head_dim = Q.shape[-1]
+      scores = np.matmul(Q_t, K_t) / np.sqrt(head_dim)
+      
+      # Apply softmax
+      scores_max = np.max(scores, axis=-1, keepdims=True)
+      exp_scores = np.exp(scores - scores_max)
+      attention = exp_scores / np.sum(exp_scores, axis=-1, keepdims=True)
+      
+      # Create clean name
+      if 'spectrogram' in layer_name:
+        # Extract layer number
+        layer_num = layer_name.split('_')[1]
+        name = f'attention_weights_L{layer_num}_audio'
+      else:
+        layer_num = layer_name.split('_')[1]
+        name = f'attention_weights_L{layer_num}_rgb'
+      
+      attention_matrices[name] = attention
+      logging.info(f"  Computed {name}: shape {attention.shape}")
+  
+  logging.info("\nFiltered activations:")
+  logging.info(f"  Encoder outputs: {len(encoder_outputs)}")
+  logging.info(f"  Bottleneck tokens: {len(bottleneck_tokens)}")
+  logging.info(f"  Attention matrices: {len(attention_matrices)}")
+  
+  return encoder_outputs, bottleneck_tokens, attention_matrices
+
+
 def save_sample_data(sample_data: Dict, sample_idx: int, output_dir: str):
   """Save activations for one sample."""
   output_path = os.path.join(output_dir, f'sample_{sample_idx:05d}.npz')
+  
+  # Filter to essential activations only
+  encoder_outputs, bottleneck_tokens, attention_matrices = filter_essential_activations(
+      sample_data['activations'],
+      sample_data.get('attention_weights', {})
+  )
   
   # Prepare data for saving
   save_dict = {
@@ -260,15 +469,23 @@ def save_sample_data(sample_data: Dict, sample_idx: int, output_dir: str):
       'sample_idx': sample_idx
   }
   
-  # Add activations
-  for name, activation in sample_data['activations'].items():
-    safe_name = name.replace('/', '_').replace('.', '_')
-    save_dict[f'activation_{safe_name}'] = activation
+  # Add encoder block outputs
+  for name, activation in encoder_outputs.items():
+    save_dict[name] = activation
+  
+  # Add bottleneck tokens
+  for name, tokens in bottleneck_tokens.items():
+    save_dict[name] = tokens
   
   # Add attention weights
-  for name, weights in sample_data['attention_weights'].items():
-    safe_name = name.replace('/', '_').replace('.', '_')
-    save_dict[f'attention_{safe_name}'] = weights
+  for name, weights in attention_matrices.items():
+    save_dict[name] = weights
+  
+  # Log what we're saving
+  total_size = sum(arr.nbytes for arr in save_dict.values() if hasattr(arr, 'nbytes'))
+  logging.info(f"Saving sample {sample_idx}:")
+  logging.info(f"  Total items: {len(save_dict)}")
+  logging.info(f"  Total size: {total_size / (1024**2):.1f} MB")
   
   np.savez_compressed(output_path, **save_dict)
   return output_path
@@ -308,7 +525,11 @@ def main(argv):
   all_logits = []
   activation_summary = {}
   
-  for sample_idx, batch in enumerate(dataset.take(num_to_process)):
+  # dataset is now an iterator, not a TF dataset
+  for sample_idx, batch in enumerate(dataset):
+    if sample_idx >= num_to_process:
+      break
+      
     if sample_idx % 10 == 0:
       logging.info(f'  Processing sample {sample_idx+1}/{num_to_process}...')
     

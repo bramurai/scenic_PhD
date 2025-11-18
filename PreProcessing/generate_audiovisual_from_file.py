@@ -48,6 +48,8 @@ if __name__ == '__main__':
     flags.DEFINE_integer('n_mels', 128, 'Number of mel frequency bins.')
     flags.DEFINE_float('win_length_ms', 25.0, 'Window length in milliseconds.')
     flags.DEFINE_float('hop_length_ms', 10.0, 'Hop length in milliseconds.')
+    flags.DEFINE_float('clip_duration', 10.0, 'Duration of audio clip to extract in seconds (e.g., 8.0 for MBT AudioSet, 10.0 for VGGSound).')
+    flags.DEFINE_float('rgb_duration', None, 'Duration of RGB clip to extract in seconds. If not set, uses clip_duration. For MBT AudioSet: use 3.0 for RGB, 8.0 for audio.')
     
     flags.mark_flag_as_required('csv_path')
     flags.mark_flag_as_required('output_path')
@@ -225,13 +227,15 @@ def create_sequence_example(video_path: str, start_time: float, end_time: float,
                            win_length_ms: float = 25.0,
                            hop_length_ms: float = 10.0,
                            min_resize: int = 256,
+                           clip_duration: float = 10.0,
+                           rgb_duration: Optional[float] = None,
                            label_to_index: Optional[Dict[str, int]] = None) -> tf.train.SequenceExample:
     """Create a SequenceExample for one video clip.
     
     Args:
         video_path: Path to video file.
         start_time: Clip start time in seconds.
-        end_time: Clip end time in seconds.
+        end_time: Clip end time in seconds (ignored if clip_duration is set).
         label: Optional label string.
         caption: Optional caption string.
         clip_id: Optional clip identifier.
@@ -242,13 +246,20 @@ def create_sequence_example(video_path: str, start_time: float, end_time: float,
         win_length_ms: Window length in ms.
         hop_length_ms: Hop length in ms.
         min_resize: Resize frames so shortest side equals this (default 256).
+        clip_duration: Duration of audio clip to extract (overrides end_time if set).
+        rgb_duration: Duration of RGB clip to extract. If None, uses clip_duration.
         label_to_index: Dictionary mapping label strings to indices (required if label is provided).
         
     Returns:
         A tf.train.SequenceExample.
     """
+    # Use separate durations for RGB and audio if specified
+    # This is needed because MBT can use different temporal windows for different modalities
+    audio_end_time = start_time + clip_duration
+    rgb_end_time = start_time + (rgb_duration if rgb_duration is not None else clip_duration)
+    
     # Extract RGB frames with aspect-ratio-preserving resize
-    frames = extract_frames_ffmpeg(video_path, start_time, end_time, target_fps, min_resize)
+    frames = extract_frames_ffmpeg(video_path, start_time, rgb_end_time, target_fps, min_resize)
     
     if not frames:
         raise ValueError(f"No frames extracted from {video_path}")
@@ -279,7 +290,7 @@ def create_sequence_example(video_path: str, start_time: float, end_time: float,
         context_dict['clip/caption/string'] = create_bytes_feature(caption.encode('utf-8'))
     
     context_dict['clip/start/timestamp'] = create_int64_feature(int(start_time * 1000000))
-    context_dict['clip/end/timestamp'] = create_int64_feature(int(end_time * 1000000))
+    context_dict['clip/end/timestamp'] = create_int64_feature(int(audio_end_time * 1000000))
     
     # Create feature lists
     feature_lists = {}
@@ -298,7 +309,7 @@ def create_sequence_example(video_path: str, start_time: float, end_time: float,
     
     # Extract and add spectrogram if requested
     if decode_audio:
-        audio = extract_audio_ffmpeg(video_path, start_time, end_time, audio_sample_rate)
+        audio = extract_audio_ffmpeg(video_path, start_time, audio_end_time, audio_sample_rate)
         
         if audio is not None and len(audio) > 0:
             try:
@@ -311,15 +322,22 @@ def create_sequence_example(video_path: str, start_time: float, end_time: float,
                 chunk_size = 100
                 total_frames = log_mel_spec.shape[0]
                 
-                # Reshape into chunks of 100 frames
-                # Pad if necessary to make divisible by chunk_size
-                num_chunks = int(np.ceil(total_frames / chunk_size))
-                padded_length = num_chunks * chunk_size
+                # Calculate expected frames based on clip_duration
+                # For 16kHz audio with 10ms hop: expected = clip_duration * 100
+                expected_frames = int(clip_duration * 100)
                 
-                if padded_length > total_frames:
-                    # Pad with zeros
-                    padding = np.zeros((padded_length - total_frames, n_mels), dtype=log_mel_spec.dtype)
+                # Truncate or pad to exact expected length
+                if total_frames > expected_frames:
+                    log_mel_spec = log_mel_spec[:expected_frames, :]
+                    total_frames = expected_frames
+                elif total_frames < expected_frames:
+                    padding = np.zeros((expected_frames - total_frames, n_mels), dtype=log_mel_spec.dtype)
                     log_mel_spec = np.vstack([log_mel_spec, padding])
+                    total_frames = expected_frames
+                
+                # Reshape into chunks of 100 frames (should divide evenly now)
+                num_chunks = total_frames // chunk_size
+                log_mel_spec = log_mel_spec[:num_chunks * chunk_size, :]  # Ensure exact division
                 
                 # Reshape to (num_chunks, chunk_size, n_mels)
                 log_mel_spec_chunked = log_mel_spec.reshape(num_chunks, chunk_size, n_mels)
@@ -445,7 +463,9 @@ def main(argv):
             audio_sample_rate=FLAGS.audio_sample_rate,
             n_mels=FLAGS.n_mels,
             win_length_ms=FLAGS.win_length_ms,
-            hop_length_ms=FLAGS.hop_length_ms
+            hop_length_ms=FLAGS.hop_length_ms,
+            clip_duration=FLAGS.clip_duration,
+            rgb_duration=FLAGS.rgb_duration
         )
         
         if sequence_example is not None:

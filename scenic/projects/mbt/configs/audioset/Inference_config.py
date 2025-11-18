@@ -55,9 +55,9 @@ def get_config():
   config.dataset_configs.modalities = ('spectrogram', 'rgb')
   config.dataset_configs.return_as_dict = True
   
-  # Match the preprocessing from training
-  config.dataset_configs.num_frames = 8
-  config.dataset_configs.stride = 8
+  # Match the preprocessing from training (balanced_audioset_base.py)
+  config.dataset_configs.num_frames = 32  # Must match training: 32 frames for RGB
+  config.dataset_configs.stride = 2  # Stride for RGB sampling
   config.dataset_configs.num_spec_frames = 8  # Number of spectrogram chunks (each chunk is 100x128)
   config.dataset_configs.spec_stride = 1
 
@@ -114,7 +114,7 @@ def get_config():
   config.model.use_bottleneck = True
   config.model.test_with_bottlenecks = True
   config.model.share_encoder = False
-  config.model.n_bottlenecks = 4
+  config.model.n_bottlenecks = 4  # Checkpoint has 5 bottlenecks total (4 + 1 for token classifier)
   
   # Layer at which to fuse. '0' refers to early fusion, if fusion_layer is equal
   # to model.num_layers, then there is no cross-modal attention in the transformer
@@ -128,7 +128,7 @@ def get_config():
   config.model.mlp_dim = 3072
   config.model.num_layers = 12
   config.model.representation_size = None
-  config.model.classifier = 'gap'
+  config.model.classifier = 'token'  # Checkpoint was trained with token classifier, not gap
   config.model.attention_dropout_rate = 0.
   config.model.dropout_rate = 0.
   config.model_dtype_str = 'float32'
@@ -173,7 +173,7 @@ def get_config():
   config.init_from.checkpoint_format = 'scenic'
   config.init_from.model_config = ml_collections.ConfigDict()
   config.init_from.model_config.model = ml_collections.ConfigDict()
-  config.init_from.model_config.model.classifier = 'gap'
+  config.init_from.model_config.model.classifier = 'token'  # Must match checkpoint training
   config.init_from.restore_positional_embedding = True
   config.init_from.restore_input_embedding = True
   config.init_from.positional_embed_size_change = 'resize_tile'

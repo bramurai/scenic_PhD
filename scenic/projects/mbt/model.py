@@ -222,6 +222,9 @@ class EncoderBlock(nn.Module):
 
     drop_pattern = self.get_drop_pattern(x, deterministic)
     x = x * (1.0 - drop_pattern) + inputs
+    
+    # Capture attention output for analysis
+    self.sow('intermediates', f'{self.name}_attention_out', x)
 
     # MLP block.
     y = nn.LayerNorm(dtype=self.dtype)(x)
@@ -235,7 +238,12 @@ class EncoderBlock(nn.Module):
             y, deterministic=deterministic)
 
     drop_pattern = self.get_drop_pattern(x, deterministic)
-    return y * (1.0 - drop_pattern) + x
+    output = y * (1.0 - drop_pattern) + x
+    
+    # Capture MLP output for analysis
+    self.sow('intermediates', f'{self.name}_mlp_out', output)
+    
+    return output
 
 
 class Encoder(nn.Module):
@@ -376,6 +384,9 @@ class Encoder(nn.Module):
         x_out.append(x[modality])
       x_out = jnp.concatenate(x_out, axis=1)
     encoded = nn.LayerNorm(name='encoder_norm')(x_out)
+    
+    # Capture final encoder output for analysis
+    self.sow('intermediates', 'encoder_output', encoded)
 
     return encoded
 

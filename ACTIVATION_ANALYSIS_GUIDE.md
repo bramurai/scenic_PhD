@@ -120,7 +120,7 @@ Each `sample_XXXXX.npz` contains:
 
 ```bash
 python analyze_activations.py \
-  --activation_dir=activation_analysis \
+  --activation_dir=audioset_analysis_AV \
   --output_dir=pca_results \
   --n_components=50 \
   --run_tsne=False

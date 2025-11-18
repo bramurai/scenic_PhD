@@ -48,6 +48,8 @@ flags.DEFINE_string('cookies_file', None, 'Path to cookies.txt file for yt-dlp a
 flags.DEFINE_string('local_videos_dir', None, 'If set, treat video paths as relative to this directory and use local mp4 files instead of downloading from YouTube.')
 flags.DEFINE_bool('require_local', False, 'If True and local_videos_dir is set, skip videos not found locally instead of falling back to YouTube download.')
 flags.DEFINE_bool('local_are_clips', False, 'If True, local videos are already 10s clips (extract 0-10s instead of using CSV start/end times).')
+flags.DEFINE_float('clip_duration', 10.0, 'Duration of audio clip to extract in seconds (e.g., 8.0 for MBT AudioSet, 10.0 for VGGSound).')
+flags.DEFINE_float('rgb_duration', None, 'Duration of RGB clip to extract in seconds. If not set, uses clip_duration. For MBT AudioSet: use 3.0 for RGB, 8.0 for audio.')
 
 flags.mark_flag_as_required('csv_path')
 flags.mark_flag_as_required('output_path')
@@ -115,14 +117,15 @@ def get_local_video_duration(file_path: str) -> Optional[float]:
 
 
 def download_youtube_video(video_id: str, start_time: int, output_path: str, 
-                          check_duration: bool = True) -> bool:
-    """Download a 10-second clip from YouTube using yt-dlp.
+                          check_duration: bool = True, clip_duration: float = 10.0) -> bool:
+    """Download a clip from YouTube using yt-dlp.
     
     Args:
         video_id: YouTube video ID.
         start_time: Start time in seconds.
         output_path: Output file path.
         check_duration: Whether to verify video duration before downloading.
+        clip_duration: Duration of clip to extract in seconds.
         
     Returns:
         True if successful, False otherwise.
@@ -135,9 +138,9 @@ def download_youtube_video(video_id: str, start_time: int, output_path: str,
             duration = get_video_duration(video_id)
             if duration is None:
                 logging.warning(f"Could not get duration for {video_id}, attempting download anyway")
-            elif start_time + 10 > duration:
+            elif start_time + clip_duration > duration:
                 logging.warning(f"Video {video_id} is only {duration:.1f}s long, "
-                              f"cannot extract segment at {start_time}s-{start_time+10}s")
+                              f"cannot extract segment at {start_time}s-{start_time+clip_duration}s")
                 return False
             # else: duration is sufficient, proceed with download
         
@@ -190,13 +193,14 @@ def download_youtube_video(video_id: str, start_time: int, output_path: str,
         return False
 
 
-def process_video_entry(row: dict, temp_dir: str, label_to_index: Optional[dict] = None, **kwargs) -> Optional[object]:
+def process_video_entry(row: dict, temp_dir: str, label_to_index: Optional[dict] = None, clip_duration: float = 10.0, **kwargs) -> Optional[object]:
     """Download video temporarily, process it, and delete it.
     
     Args:
         row: CSV row with video_id, start, end, label, clip_id.
         temp_dir: Temporary directory for downloads.
         label_to_index: Dictionary mapping label strings to indices.
+        clip_duration: Duration of clip to extract in seconds.
         **kwargs: Additional arguments for create_sequence_example.
         
     Returns:
@@ -208,7 +212,7 @@ def process_video_entry(row: dict, temp_dir: str, label_to_index: Optional[dict]
     video_id = video_path.rsplit('_', 1)[0]  # Split from right, keep left part
     
     start_time = int(row['start'])
-    end_time = int(row['end'])
+    end_time = start_time + clip_duration  # Use clip_duration instead of CSV end time
     label = row.get('label')
     clip_id = row.get('clip_id')
     
@@ -217,8 +221,26 @@ def process_video_entry(row: dict, temp_dir: str, label_to_index: Optional[dict]
     delete_temp = True
     
     try:
-        # If a local videos directory is provided, prefer local files and skip download
-        if FLAGS.local_videos_dir:
+        # Check temp_downloads/ directory first (takes priority over local_videos_dir)
+        temp_downloads_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp_downloads')
+        temp_downloads_candidate = os.path.join(temp_downloads_dir, os.path.basename(video_path))
+        
+        if os.path.exists(temp_downloads_candidate):
+            logging.info(f"Found video in temp_downloads/ for {clip_id}: {temp_downloads_candidate}")
+            temp_video = temp_downloads_candidate
+            delete_temp = False
+            
+            # Check duration using ffprobe
+            if FLAGS.check_duration:
+                duration = get_local_video_duration(temp_downloads_candidate)
+                if duration is None:
+                    logging.warning(f"Could not get duration for {temp_downloads_candidate}, attempting processing anyway")
+                elif start_time + clip_duration > duration:
+                    logging.warning(f"Video {temp_downloads_candidate} is only {duration:.1f}s long, cannot extract segment at {start_time}s-{end_time}s")
+                    return None
+        
+        # If not in temp_downloads/, check local_videos_dir
+        elif FLAGS.local_videos_dir:
             # The CSV may contain filenames like '..._000001.mp4' or full paths; use basename when joining
             candidate = os.path.join(FLAGS.local_videos_dir, os.path.basename(video_path))
             if os.path.exists(candidate):
@@ -226,19 +248,19 @@ def process_video_entry(row: dict, temp_dir: str, label_to_index: Optional[dict]
                 temp_video = candidate
                 delete_temp = False
                 
-                # If local videos are already 10s clips, extract from 0-10 instead of CSV start/end
+                # If local videos are already clips, extract from 0-clip_duration instead of CSV start/end
                 if FLAGS.local_are_clips:
                     start_time = 0
-                    end_time = 10
-                    logging.info(f"Local video is pre-clipped, extracting 0-10s instead of {row['start']}-{row['end']}s")
+                    end_time = clip_duration
+                    logging.info(f"Local video is pre-clipped, extracting 0-{clip_duration}s instead of {row['start']}-{row['end']}s")
                 
                 # Optionally check duration using ffprobe
                 if FLAGS.check_duration and not FLAGS.local_are_clips:
                     duration = get_local_video_duration(candidate)
                     if duration is None:
                         logging.warning(f"Could not get local duration for {candidate}, attempting processing anyway")
-                    elif start_time + 10 > duration:
-                        logging.warning(f"Local video {candidate} is only {duration:.1f}s long, cannot extract segment at {start_time}s-{start_time+10}s")
+                    elif start_time + clip_duration > duration:
+                        logging.warning(f"Local video {candidate} is only {duration:.1f}s long, cannot extract segment at {start_time}s-{end_time}s")
                         return None
             else:
                 # If require_local is set, skip this video instead of downloading
@@ -250,17 +272,18 @@ def process_video_entry(row: dict, temp_dir: str, label_to_index: Optional[dict]
 
         # Download video if we don't already have a local file
         if delete_temp:
-            if not download_youtube_video(video_id, start_time, temp_video, check_duration=FLAGS.check_duration):
+            if not download_youtube_video(video_id, start_time, temp_video, check_duration=FLAGS.check_duration, clip_duration=clip_duration):
                 return None
 
         # Process video - extract the specific segment with ffmpeg
         sequence_example = gen_module.create_sequence_example(
             video_path=temp_video,
             start_time=start_time,  # Extract from full video
-            end_time=end_time,      # 10 second clips
+            end_time=end_time,      # Calculated from clip_duration
             label=label,
             clip_id=clip_id,
             label_to_index=label_to_index,
+            clip_duration=clip_duration,  # Pass clip_duration to override end_time
             **kwargs
         )
 
@@ -396,6 +419,8 @@ def main(argv):
             row.to_dict(),
             temp_dir,
             label_to_index=label_to_index,
+            clip_duration=FLAGS.clip_duration,
+            rgb_duration=FLAGS.rgb_duration,
             target_fps=FLAGS.target_fps,
             decode_audio=FLAGS.decode_audio,
             audio_sample_rate=FLAGS.audio_sample_rate,
