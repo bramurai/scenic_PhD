@@ -152,8 +152,10 @@ def main():
     
     # Find TFRecord files
     base_dir = '/home/labuta/Documents/Bram/scenic_PhD'
-    train_pattern = os.path.join(base_dir, 'train_tfrecords_local/tar*_batch*/data-*-of-*.tfrecord')
-    
+    #train_pattern = os.path.join(base_dir, 'train_tfrecords_local/tar*_batch*/data-*-of-*.tfrecord')
+    train_pattern = os.path.join(base_dir, 'Datasets/audioset_eval_100/data-*-of-*.tfrecord')
+
+
     train_files = sorted(glob.glob(train_pattern))
     
     if not train_files:

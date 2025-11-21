@@ -48,7 +48,7 @@ flags.DEFINE_string('cookies_file', None, 'Path to cookies.txt file for yt-dlp a
 flags.DEFINE_string('local_videos_dir', None, 'If set, treat video paths as relative to this directory and use local mp4 files instead of downloading from YouTube.')
 flags.DEFINE_bool('require_local', False, 'If True and local_videos_dir is set, skip videos not found locally instead of falling back to YouTube download.')
 flags.DEFINE_bool('local_are_clips', False, 'If True, local videos are already 10s clips (extract 0-10s instead of using CSV start/end times).')
-flags.DEFINE_float('clip_duration', 10.0, 'Duration of audio clip to extract in seconds (e.g., 8.0 for MBT AudioSet, 10.0 for VGGSound).')
+flags.DEFINE_float('clip_duration', 8.0, 'Duration of audio clip to extract in seconds (e.g., 8.0 for MBT AudioSet, 10.0 for VGGSound).')
 flags.DEFINE_float('rgb_duration', None, 'Duration of RGB clip to extract in seconds. If not set, uses clip_duration. For MBT AudioSet: use 3.0 for RGB, 8.0 for audio.')
 
 flags.mark_flag_as_required('csv_path')

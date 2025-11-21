@@ -7,13 +7,24 @@ This script:
 3. Extracts all layer activations and attention weights
 4. Saves outputs for PCA, attention flow analysis, etc.
 
+Memory Management:
+  - Processes one sample at a time to minimize memory usage
+  - Clears JAX cache every N samples (default: 10)
+  - Supports resume from crashes (skips already processed samples)
+  - If crashes occur, reduce --clear_cache_every to 5 or lower
+
 Usage:
   python extract_mbt_activations.py \
     --config=scenic/projects/mbt/configs/audioset/vggsound_base.py \
     --checkpoint_dir=mbt_base \
     --test_data_dir=/media/labuta/7f1ad7d2-a1d3-4a1f-ae81-7cb5dd2661a3/VGG_Preprocessed/test_tfrecords_local \
     --output_dir=activation_analysis \
-    --num_samples=100
+    --num_samples=100 \
+    --clear_cache_every=10 \
+    --resume=True
+
+Resume after crash:
+  Just re-run the same command. Already processed samples will be skipped automatically.
 """
 
 import os
@@ -44,6 +55,16 @@ flags.DEFINE_integer('num_samples', 100, 'Number of samples to process')
 flags.DEFINE_integer('checkpoint_step', None, 
                      'Specific checkpoint step to load (e.g., 1000, 5000). '
                      'If None, loads the latest checkpoint.')
+flags.DEFINE_bool('average_attention_heads', True,
+                  'If True, average attention over heads to reduce file size (12x smaller). '
+                  'Shape becomes (seq_len, seq_len) instead of (num_heads, seq_len, seq_len). '
+                  'Recommended for attention flow analysis.')
+flags.DEFINE_bool('resume', True,
+                  'If True, skip already processed samples (checks for existing sample_*.npz files). '
+                  'Useful for resuming after crashes.')
+flags.DEFINE_integer('clear_cache_every', 10,
+                     'Clear JAX compilation cache every N samples to prevent memory buildup. '
+                     'Lower values use less memory but may be slower.')
 
 flags.mark_flag_as_required('config')
 flags.mark_flag_as_required('checkpoint_dir')
@@ -394,6 +415,8 @@ def filter_essential_activations(activations: Dict, attention_weights: Dict) -> 
   
   # Compute attention weights for each encoder block
   logging.info("\nComputing attention weights for encoder blocks...")
+  if FLAGS.average_attention_heads:
+    logging.info("  Averaging over attention heads (12 -> 1) for smaller file size")
   attention_layers = {}
   
   # Find query and key for each attention layer
@@ -432,6 +455,13 @@ def filter_essential_activations(activations: Dict, attention_weights: Dict) -> 
       scores_max = np.max(scores, axis=-1, keepdims=True)
       exp_scores = np.exp(scores - scores_max)
       attention = exp_scores / np.sum(exp_scores, axis=-1, keepdims=True)
+      # Shape: (batch, num_heads, seq_len, seq_len)
+      
+      # Average over heads if requested (for attention flow analysis)
+      if FLAGS.average_attention_heads:
+        attention = np.mean(attention, axis=1)  # (batch, seq_len, seq_len)
+        # Remove batch dimension for single sample
+        attention = attention[0]  # (seq_len, seq_len)
       
       # Create clean name
       if 'spectrogram' in layer_name:
@@ -453,7 +483,7 @@ def filter_essential_activations(activations: Dict, attention_weights: Dict) -> 
   return encoder_outputs, bottleneck_tokens, attention_matrices
 
 
-def save_sample_data(sample_data: Dict, sample_idx: int, output_dir: str):
+def save_sample_data(sample_data: Dict, sample_idx: int, output_dir: str, label: np.ndarray = None):
   """Save activations for one sample."""
   output_path = os.path.join(output_dir, f'sample_{sample_idx:05d}.npz')
   
@@ -468,6 +498,10 @@ def save_sample_data(sample_data: Dict, sample_idx: int, output_dir: str):
       'logits': sample_data['logits'],
       'sample_idx': sample_idx
   }
+  
+  # Add ground truth label if provided
+  if label is not None:
+    save_dict['label'] = label
   
   # Add encoder block outputs
   for name, activation in encoder_outputs.items():
@@ -491,6 +525,33 @@ def save_sample_data(sample_data: Dict, sample_idx: int, output_dir: str):
   return output_path
 
 
+def get_already_processed_samples(output_dir: str) -> set:
+  """Find which samples have already been processed.
+  
+  Returns:
+    Set of sample indices that have been successfully saved
+  """
+  import glob
+  processed = set()
+  
+  sample_files = glob.glob(os.path.join(output_dir, 'sample_*.npz'))
+  for sample_file in sample_files:
+    # Extract sample index from filename: sample_00042.npz -> 42
+    basename = os.path.basename(sample_file)
+    try:
+      idx_str = basename.replace('sample_', '').replace('.npz', '')
+      idx = int(idx_str)
+      processed.add(idx)
+    except ValueError:
+      continue
+  
+  if processed:
+    logging.info(f'Found {len(processed)} already processed samples')
+    logging.info(f'Will resume from sample {max(processed) + 1}')
+  
+  return processed
+
+
 def main(argv):
   del argv
   
@@ -500,6 +561,11 @@ def main(argv):
   
   # Create output directory
   os.makedirs(FLAGS.output_dir, exist_ok=True)
+  
+  # Check for already processed samples (for resume capability)
+  already_processed = set()
+  if FLAGS.resume:
+    already_processed = get_already_processed_samples(FLAGS.output_dir)
   
   # Load config
   logging.info('\n[1/4] Loading configuration...')
@@ -523,51 +589,140 @@ def main(argv):
   logging.info(f'\n[4/4] Extracting activations from {num_to_process} samples...')
   
   all_logits = []
-  activation_summary = {}
+  all_labels = []
+  processed_count = 0
+  skipped_count = 0
   
   # dataset is now an iterator, not a TF dataset
   for sample_idx, batch in enumerate(dataset):
     if sample_idx >= num_to_process:
       break
+    
+    # Skip if already processed (resume capability)
+    if sample_idx in already_processed:
+      skipped_count += 1
+      if skipped_count % 10 == 0:
+        logging.info(f'  Skipped {skipped_count} already processed samples...')
+      continue
       
-    if sample_idx % 10 == 0:
-      logging.info(f'  Processing sample {sample_idx+1}/{num_to_process}...')
+    if processed_count % 10 == 0:
+      logging.info(f'  Processing sample {sample_idx+1}/{num_to_process} '
+                  f'(processed: {processed_count}, skipped: {skipped_count})...')
     
-    # Extract activations
-    inputs = batch['inputs']
-    result = extract_with_intermediates(model_instance, params, model_state, inputs)
-    
-    # Save individual sample
-    output_path = save_sample_data(result, sample_idx, FLAGS.output_dir)
-    
-    # Collect summary stats
-    all_logits.append(result['logits'])
-    
-    if sample_idx == 0:
-      # Log layer information
-      logging.info(f'\n  Extracted {len(result["activations"])} activation layers:')
-      for name, activation in result['activations'].items():
-        logging.info(f'    {name}: {activation.shape}')
+    try:
+      # Extract activations
+      inputs = batch['inputs']
+      labels = batch['label']  # One-hot encoded labels
+      result = extract_with_intermediates(model_instance, params, model_state, inputs)
       
-      if result['attention_weights']:
-        logging.info(f'\n  Extracted {len(result["attention_weights"])} attention weight matrices:')
-        for name, weights in result['attention_weights'].items():
-          logging.info(f'    {name}: {weights.shape}')
+      # Save individual sample with ground truth label
+      save_sample_data(result, sample_idx, FLAGS.output_dir, label=labels)
+      
+      # Collect summary stats
+      all_logits.append(result['logits'])
+      all_labels.append(labels)
+      processed_count += 1
+      
+      if sample_idx == 0:
+        # Log layer information
+        logging.info(f'\n  Extracted {len(result["activations"])} activation layers:')
+        for name, activation in result['activations'].items():
+          logging.info(f'    {name}: {activation.shape}')
+        
+        if result['attention_weights']:
+          logging.info(f'\n  Extracted {len(result["attention_weights"])} attention weight matrices:')
+          for name, weights in result['attention_weights'].items():
+            logging.info(f'    {name}: {weights.shape}')
+      
+      # Clear JAX cache periodically to prevent memory buildup
+      if processed_count % FLAGS.clear_cache_every == 0:
+        logging.info(f'  Clearing JAX cache (processed {processed_count} samples)...')
+        jax.clear_caches()
+        import gc
+        gc.collect()
+    
+    except Exception as e:
+      logging.error(f'ERROR processing sample {sample_idx}: {e}')
+      logging.error('Continuing with next sample...')
+      import traceback
+      logging.error(traceback.format_exc())
+      continue
   
-  # Save summary
-  logging.info('\nSaving summary...')
+  # Save summary and compute metrics
+  logging.info('\nSaving summary and computing metrics...')
   summary_path = os.path.join(FLAGS.output_dir, 'summary.npz')
-  np.savez_compressed(
-      summary_path,
-      logits=np.array(all_logits),
-      num_samples=num_to_process
-  )
+  
+  if all_logits and all_labels:
+    all_logits = np.array(all_logits).squeeze()  # Shape: (N, num_classes)
+    all_labels = np.array(all_labels).squeeze()  # Shape: (N, num_classes)
+    
+    # Compute mAP (mean Average Precision)
+    # Convert logits to probabilities using sigmoid (multi-label classification)
+    from scipy.special import expit
+    all_probs = expit(all_logits)
+    
+    # Compute per-class Average Precision
+    from sklearn.metrics import average_precision_score
+    try:
+      # Compute mAP across all classes
+      # Note: This assumes multi-label classification (AudioSet is multi-label)
+      mean_ap = average_precision_score(all_labels, all_probs, average='micro')
+      
+      # Compute per-class AP (only for classes that have at least one positive example)
+      per_class_ap = []
+      for class_idx in range(all_labels.shape[1]):
+        if all_labels[:, class_idx].sum() > 0:  # Only if class has positive examples
+          ap = average_precision_score(all_labels[:, class_idx], all_probs[:, class_idx])
+          per_class_ap.append(ap)
+        else:
+          per_class_ap.append(np.nan)
+      per_class_ap = np.array(per_class_ap)
+      
+      # Compute macro mAP (average over classes with positive examples)
+      macro_map = np.nanmean(per_class_ap)
+      
+      logging.info('\nEvaluation Metrics:')
+      logging.info(f'  Micro mAP (across all samples): {mean_ap:.4f}')
+      logging.info(f'  Macro mAP (average per class): {macro_map:.4f}')
+      logging.info(f'  Number of classes with positive examples: {(~np.isnan(per_class_ap)).sum()}')
+      
+      # Warning about label mapping
+      logging.info('\n' + '!'*80)
+      logging.warning('IMPORTANT: If your TFRecords were created with custom label indices')
+      logging.warning('(0-76) instead of official AudioSet indices (0-526), the mAP will be')
+      logging.warning('INCORRECT. The model expects AudioSet indices. Check label_mapping.txt')
+      logging.warning('in your dataset directory and re-preprocess if needed.')
+      logging.warning('Expected mAP for AudioSet model: ~50%')
+      logging.info('!'*80)
+      
+      # Save to summary
+      np.savez_compressed(
+          summary_path,
+          logits=all_logits,
+          labels=all_labels,
+          probabilities=all_probs,
+          per_class_ap=per_class_ap,
+          micro_map=mean_ap,
+          macro_map=macro_map,
+          num_samples=len(all_logits)
+      )
+    except Exception as e:
+      logging.error(f'Error computing mAP: {e}')
+      # Save without metrics
+      np.savez_compressed(
+          summary_path,
+          logits=all_logits,
+          labels=all_labels,
+          num_samples=len(all_logits)
+      )
   
   # Save metadata
   metadata = {
       'checkpoint_dir': FLAGS.checkpoint_dir,
       'test_data_dir': FLAGS.test_data_dir,
       'num_samples': num_to_process,
+      'processed_samples': processed_count,
+      'skipped_samples': skipped_count,
       'config': config.to_dict()
   }
   metadata_path = os.path.join(FLAGS.output_dir, 'metadata.pkl')
@@ -576,7 +731,9 @@ def main(argv):
   
   logging.info('\n' + '='*80)
   logging.info('Extraction Complete!')
-  logging.info(f'Processed {num_to_process} samples')
+  logging.info(f'Processed {processed_count} new samples')
+  logging.info(f'Skipped {skipped_count} already processed samples')
+  logging.info(f'Total samples in output: {processed_count + skipped_count}')
   logging.info(f'Outputs saved to: {FLAGS.output_dir}')
   logging.info('='*80)
   
@@ -586,6 +743,11 @@ def main(argv):
   logging.info(f'  data = np.load("{FLAGS.output_dir}/sample_00000.npz")')
   logging.info('  logits = data["logits"]')
   logging.info('  activation = data["activation_<layer_name>"]')
+  logging.info('\nTo load evaluation metrics:')
+  logging.info(f'  summary = np.load("{FLAGS.output_dir}/summary.npz")')
+  logging.info('  micro_map = summary["micro_map"]  # mAP across all samples')
+  logging.info('  macro_map = summary["macro_map"]  # Average per-class AP')
+  logging.info('  per_class_ap = summary["per_class_ap"]  # AP for each class')
 
 
 if __name__ == '__main__':
