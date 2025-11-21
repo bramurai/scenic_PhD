@@ -25,8 +25,8 @@ This config is designed to:
 
 import ml_collections
 
-# 9 test samples in Audioset_test folder
-AUDIOSET_TEST_SIZE = 9
+# 85 test samples in Audioset_test folder
+AUDIOSET_TEST_SIZE = 85
 
 
 def get_config():

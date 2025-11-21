@@ -116,6 +116,16 @@ Each `sample_XXXXX.npz` contains:
 - `activation_<layer_name>`: Activations from each layer
 - `attention_<layer_name>`: Attention weights from each attention layer
 
+### Step 2: Analyze Activations (RDM)
+## RDM computation
+```bash
+python compute_rdm.py --activation_dir=audioset_analysis_AV --output_dir=ARDM_class_averaged --distance_metric=correlation --standardize=True --average_by_class=True --label_mapping_file=audioset_ontology_full.txt --plot_dendrograms=False --use_cache=False
+```
+# Further RDM analysis
+```bash
+python analyze_rdm_changes.py
+```
+
 ### Step 2: Analyze Activations (PCA, Attention Flow)
 
 ```bash

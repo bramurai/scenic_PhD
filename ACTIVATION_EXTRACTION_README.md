@@ -399,15 +399,7 @@ plt.savefig('cls_tokens_across_samples.png', dpi=150)
 
 plt.savefig('cls_tokens_across_samples.png', dpi=150)
 ```
-## RDM computation
-```bash
-python compute_rdm.py \
-  --activation_dir=audioset_activations \
-  --output_dir=audioset_rdm_analysis \
-  --distance_metric=correlation \
-  --standardize=True \
-  --plot_dendrograms=True
-```
+
 
 ## Troubleshooting
 
