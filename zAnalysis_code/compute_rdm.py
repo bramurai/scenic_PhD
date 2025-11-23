@@ -362,7 +362,6 @@ def plot_rdm(rdm: np.ndarray,
     
     rdm_sorted = rdm[order][:, order]
     labels_sorted = labels[order]
-    label_names_sorted = [label_names[i] for i in order]
     
     # Plot RDM
     im = ax_rdm.imshow(rdm_sorted, cmap='viridis', aspect='auto')
@@ -397,12 +396,12 @@ def plot_rdm(rdm: np.ndarray,
     
     # Create class names with proper counts
     for label in unique_labels_sorted:
-        count = label_counts[label]
+        #count = label_counts[label]
         base_name = label_to_name.get(label, f'Class {label}')
         # Truncate long names for better readability
         if len(base_name) > 25:
             base_name = base_name[:22] + '...'
-        class_names.append(f'{base_name} (n={count})')
+        #class_names.append(f'{base_name} (n={count})')
     
     # Set tick positions at class midpoints
     ax_rdm.set_xticks(class_midpoints)

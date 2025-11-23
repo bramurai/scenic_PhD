@@ -42,7 +42,7 @@ flags.DEFINE_bool('skip_existing', True, 'Skip if TFRecord shard already process
 flags.DEFINE_integer('batch_size', 100, 'Process this many videos before cleaning temp files.')
 flags.DEFINE_string('progress_file', None, 'File to track progress (auto-generated if not specified).')
 flags.DEFINE_integer('save_progress_every', 50, 'Save progress every N videos.')
-flags.DEFINE_bool('check_duration', True, 'Verify video duration before downloading segment.')
+flags.DEFINE_bool('check_duration', False, 'Verify video duration before downloading segment.')
 flags.DEFINE_string('cookies_from_browser', None, 'Browser to extract cookies from (chrome, firefox, edge, etc).')
 flags.DEFINE_string('cookies_file', None, 'Path to cookies.txt file for yt-dlp authentication.')
 flags.DEFINE_string('local_videos_dir', None, 'If set, treat video paths as relative to this directory and use local mp4 files instead of downloading from YouTube.')
@@ -50,6 +50,8 @@ flags.DEFINE_bool('require_local', False, 'If True and local_videos_dir is set, 
 flags.DEFINE_bool('local_are_clips', False, 'If True, local videos are already 10s clips (extract 0-10s instead of using CSV start/end times).')
 flags.DEFINE_float('clip_duration', 8.0, 'Duration of audio clip to extract in seconds (e.g., 8.0 for MBT AudioSet, 10.0 for VGGSound).')
 flags.DEFINE_float('rgb_duration', None, 'Duration of RGB clip to extract in seconds. If not set, uses clip_duration. For MBT AudioSet: use 3.0 for RGB, 8.0 for audio.')
+flags.DEFINE_string('audioset_labels_csv', None, 'Path to audioset_labels.csv for mapping MIDs to indices (required for AudioSet data).')
+flags.DEFINE_bool('audioset_multilabel', False, 'If True, use multi-hot encoding for AudioSet labels (multiple labels per sample).')
 
 flags.mark_flag_as_required('csv_path')
 flags.mark_flag_as_required('output_path')
@@ -114,6 +116,61 @@ def get_local_video_duration(file_path: str) -> Optional[float]:
         return None
     except Exception:
         return None
+
+
+def load_audioset_labels(audioset_labels_csv: str) -> dict:
+    """Load AudioSet label mapping from CSV.
+    
+    Args:
+        audioset_labels_csv: Path to audioset_labels.csv with columns: index, mid, display_name
+        
+    Returns:
+        Dictionary mapping MID to index, e.g., {'/m/09x0r': 0, '/m/05zppz': 1, ...}
+    """
+    import pandas as pd
+    
+    logging.info(f'Loading AudioSet labels from {audioset_labels_csv}')
+    df = pd.read_csv(audioset_labels_csv)
+    
+    # Create MID to index mapping
+    mid_to_index = {}
+    for _, row in df.iterrows():
+        mid = row['mid']
+        index = int(row['index'])
+        mid_to_index[mid] = index
+    
+    logging.info(f'Loaded {len(mid_to_index)} AudioSet labels')
+    return mid_to_index
+
+
+def parse_audioset_labels(label_string: str, mid_to_index: dict, num_classes: int = 527) -> np.ndarray:
+    """Parse AudioSet label string into multi-hot encoding.
+    
+    Args:
+        label_string: Comma-separated MIDs like "/m/068hy,/m/07q6cd_,/m/0bt9lr"
+        mid_to_index: Dictionary mapping MID to index
+        num_classes: Total number of AudioSet classes (default 527)
+        
+    Returns:
+        Multi-hot label array of shape (num_classes,) with 1s for present classes
+    """
+    import numpy as np
+    
+    # Create zero array
+    multi_hot = np.zeros(num_classes, dtype=np.float32)
+    
+    # Parse comma-separated MIDs
+    mids = [mid.strip() for mid in label_string.split(',')]
+    
+    # Set 1s for present labels
+    for mid in mids:
+        if mid in mid_to_index:
+            index = mid_to_index[mid]
+            multi_hot[index] = 1.0
+        else:
+            logging.warning(f'Unknown MID: {mid}')
+    
+    return multi_hot
 
 
 def download_youtube_video(video_id: str, start_time: int, output_path: str, 
@@ -193,13 +250,15 @@ def download_youtube_video(video_id: str, start_time: int, output_path: str,
         return False
 
 
-def process_video_entry(row: dict, temp_dir: str, label_to_index: Optional[dict] = None, clip_duration: float = 10.0, **kwargs) -> Optional[object]:
+def process_video_entry(row: dict, temp_dir: str, label_to_index: Optional[dict] = None, 
+                        mid_to_index: Optional[dict] = None, clip_duration: float = 10.0, **kwargs) -> Optional[object]:
     """Download video temporarily, process it, and delete it.
     
     Args:
         row: CSV row with video_id, start, end, label, clip_id.
         temp_dir: Temporary directory for downloads.
-        label_to_index: Dictionary mapping label strings to indices.
+        label_to_index: Dictionary mapping label strings to indices (for single-label datasets).
+        mid_to_index: Dictionary mapping AudioSet MIDs to indices (for AudioSet multilabel).
         clip_duration: Duration of clip to extract in seconds.
         **kwargs: Additional arguments for create_sequence_example.
         
@@ -275,14 +334,21 @@ def process_video_entry(row: dict, temp_dir: str, label_to_index: Optional[dict]
             if not download_youtube_video(video_id, start_time, temp_video, check_duration=FLAGS.check_duration, clip_duration=clip_duration):
                 return None
 
+        # Process label: if AudioSet multilabel mode, parse MIDs to multi-hot array
+        processed_label = label
+        if mid_to_index is not None and label:
+            # AudioSet multi-label mode: convert MID string to multi-hot array
+            processed_label = parse_audioset_labels(label, mid_to_index)
+            logging.info(f"Converted label '{label}' to multi-hot array with {int(processed_label.sum())} active classes")
+        
         # Process video - extract the specific segment with ffmpeg
         sequence_example = gen_module.create_sequence_example(
             video_path=temp_video,
             start_time=start_time,  # Extract from full video
             end_time=end_time,      # Calculated from clip_duration
-            label=label,
+            label=processed_label,  # Either original string or multi-hot array
             clip_id=clip_id,
-            label_to_index=label_to_index,
+            label_to_index=label_to_index if mid_to_index is None else None,  # Only use label_to_index for non-AudioSet
             clip_duration=clip_duration,  # Pass clip_duration to override end_time
             **kwargs
         )
@@ -325,9 +391,17 @@ def main(argv):
     total_examples = len(df)
     logging.info(f"Processing {total_examples} examples")
     
-    # Create label-to-index mapping from unique labels in CSV
+    # Handle label mapping based on mode (AudioSet multilabel vs single-label)
     label_to_index = None
-    if 'label' in df.columns:
+    mid_to_index = None
+    
+    if FLAGS.audioset_labels_csv:
+        # AudioSet multilabel mode: load MID to index mapping
+        logging.info(f"Loading AudioSet labels from {FLAGS.audioset_labels_csv}")
+        mid_to_index = load_audioset_labels(FLAGS.audioset_labels_csv)
+        logging.info(f"AudioSet multilabel mode: using {len(mid_to_index)} classes")
+    elif 'label' in df.columns:
+        # Single-label mode: create label-to-index mapping from unique labels in CSV
         unique_labels = sorted(df['label'].dropna().unique())
         label_to_index = {label: idx for idx, label in enumerate(unique_labels)}
         logging.info(f"Created label mapping with {len(label_to_index)} unique labels")
@@ -340,7 +414,7 @@ def main(argv):
                 f.write(f"{idx}\t{label}\n")
         logging.info(f"Saved label mapping to {label_mapping_path}")
     else:
-        logging.warning("No 'label' column found in CSV")
+        logging.warning("No 'label' column found in CSV and no AudioSet labels provided")
     
     # Create output directory
     os.makedirs(FLAGS.output_path, exist_ok=True)
@@ -419,6 +493,7 @@ def main(argv):
             row.to_dict(),
             temp_dir,
             label_to_index=label_to_index,
+            mid_to_index=mid_to_index,
             clip_duration=FLAGS.clip_duration,
             rgb_duration=FLAGS.rgb_duration,
             target_fps=FLAGS.target_fps,

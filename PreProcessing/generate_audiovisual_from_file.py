@@ -18,7 +18,7 @@ Usage:
 import os
 import csv
 import math
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 from absl import app
 from absl import flags
 from absl import logging
@@ -217,7 +217,7 @@ def create_bytes_feature(value):
 
 
 def create_sequence_example(video_path: str, start_time: float, end_time: float,
-                           label: Optional[str] = None, 
+                           label: Optional[Union[str, np.ndarray]] = None, 
                            caption: Optional[str] = None,
                            clip_id: Optional[str] = None,
                            target_fps: int = 25,
@@ -236,7 +236,7 @@ def create_sequence_example(video_path: str, start_time: float, end_time: float,
         video_path: Path to video file.
         start_time: Clip start time in seconds.
         end_time: Clip end time in seconds (ignored if clip_duration is set).
-        label: Optional label string.
+        label: Optional label - either string (single-label) or numpy array (multi-hot AudioSet).
         caption: Optional caption string.
         clip_id: Optional clip identifier.
         target_fps: Target frames per second.
@@ -248,7 +248,7 @@ def create_sequence_example(video_path: str, start_time: float, end_time: float,
         min_resize: Resize frames so shortest side equals this (default 256).
         clip_duration: Duration of audio clip to extract (overrides end_time if set).
         rgb_duration: Duration of RGB clip to extract. If None, uses clip_duration.
-        label_to_index: Dictionary mapping label strings to indices (required if label is provided).
+        label_to_index: Dictionary mapping label strings to indices (only for string labels).
         
     Returns:
         A tf.train.SequenceExample.
@@ -271,20 +271,30 @@ def create_sequence_example(video_path: str, start_time: float, end_time: float,
         context_dict['clip/media_id'] = create_bytes_feature(clip_id.encode('utf-8'))
     
     if label is not None:
-        context_dict['clip/label/string'] = create_bytes_feature(label.encode('utf-8'))
-        
-        # Use label_to_index mapping if provided, otherwise use placeholder
-        if label_to_index is not None:
-            if label in label_to_index:
-                label_idx = label_to_index[label]
-            else:
-                logging.warning(f"Label '{label}' not found in label_to_index mapping, using -1")
-                label_idx = -1
+        # Handle multi-hot label (numpy array) vs string label
+        if isinstance(label, np.ndarray):
+            # Multi-hot label (AudioSet): store as float array
+            context_dict['clip/label/multi_hot'] = create_float_feature(label.astype(np.float32).tolist())
+            # Store number of active labels for reference
+            num_active = int(label.sum())
+            context_dict['clip/label/num_active'] = create_int64_feature(num_active)
+            logging.info(f"Storing multi-hot label with {num_active} active classes")
         else:
-            logging.warning("No label_to_index mapping provided, all labels will be mapped to 0")
-            label_idx = 0
-        
-        context_dict['clip/label/index'] = create_int64_feature(label_idx)
+            # String label (single-label datasets): store string and index
+            context_dict['clip/label/string'] = create_bytes_feature(label.encode('utf-8'))
+            
+            # Use label_to_index mapping if provided, otherwise use placeholder
+            if label_to_index is not None:
+                if label in label_to_index:
+                    label_idx = label_to_index[label]
+                else:
+                    logging.warning(f"Label '{label}' not found in label_to_index mapping, using -1")
+                    label_idx = -1
+            else:
+                logging.warning("No label_to_index mapping provided, all labels will be mapped to 0")
+                label_idx = 0
+            
+            context_dict['clip/label/index'] = create_int64_feature(label_idx)
     
     if caption is not None:
         context_dict['clip/caption/string'] = create_bytes_feature(caption.encode('utf-8'))
