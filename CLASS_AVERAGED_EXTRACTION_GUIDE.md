@@ -23,8 +23,8 @@ For each of 527 classes:
 ## Usage
 
 ```bash
-python zAnalysis_code/extract_mbt_activations_class_averaged.py \
-  --scenic/projects/mbt/configs/audioset/Inference_config.py \
+python extract_mbt_activations_class_averaged.py \
+  --config=scenic/projects/mbt/configs/audioset/Inference_config.py \
   --checkpoint_dir=CheckPoints/MBT_AV \
   --test_data_dir=Datasets/audioset_eval \
   --output_dir=audioset_analysis_AV \

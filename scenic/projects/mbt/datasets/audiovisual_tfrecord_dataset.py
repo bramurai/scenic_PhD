@@ -223,8 +223,8 @@ class AVTFRecordDatasetFactory(video_tfrecord_dataset.TFRecordDatasetFactory):
         parser_builder=self.parser_builder,
         decoder_builder=self.decoder_builder,
         preprocessor_builder=self.preprocessor_builder,
-        is_multi_label=False,
-        one_hot_label=True,
+        is_multi_label=True,
+        one_hot_label=True,  # Keep multi-hot format from TFRecords
         num_classes=self.num_classes,
         add_label_name=False)
 

@@ -26,6 +26,7 @@ Usage:
 
 import os
 import pickle
+import time
 from typing import Dict, Any
 from collections import defaultdict
 from absl import app, flags, logging
@@ -49,9 +50,12 @@ flags.DEFINE_string('test_data_dir', None, 'Directory with test TFRecords')
 flags.DEFINE_string('output_dir', 'audioset_class_averaged', 'Output directory')
 flags.DEFINE_string('audioset_labels_csv', None, 'Path to audioset_labels.csv for class names')
 flags.DEFINE_integer('num_samples', None, 'Number of samples to process (None = all)')
+flags.DEFINE_integer('batch_size', 4, 'Batch size for processing (higher = faster but more memory)')
 flags.DEFINE_bool('average_attention_heads', True, 'Average attention over heads to reduce size')
-flags.DEFINE_integer('clear_cache_every', 10, 'Clear JAX cache every N samples')
+flags.DEFINE_integer('clear_cache_every', 1, 'Clear JAX cache every N samples')
 flags.DEFINE_bool('save_attention', False, 'Save attention weights (increases storage significantly)')
+flags.DEFINE_integer('checkpoint_every', 50, 'Save intermediate checkpoint every N batches (0 = disable)')
+flags.DEFINE_bool('resume_from_checkpoint', True, 'Resume from checkpoint if it exists')
 
 flags.mark_flag_as_required('config')
 flags.mark_flag_as_required('checkpoint_dir')
@@ -75,8 +79,34 @@ def load_config(config_path: str) -> ml_collections.ConfigDict:
   return config
 
 
+def read_labels_from_tfrecord(tfrecord_path: str) -> list:
+  """Read ALL multi-hot labels from a TFRecord file.
+  
+  Args:
+    tfrecord_path: Path to TFRecord file
+    
+  Returns:
+    List of multi-hot label vectors, one per sample in the file
+  """
+  labels = []
+  
+  # Read ALL records from this file (not just the first one)
+  for raw_record in tf.data.TFRecordDataset([tfrecord_path]):
+    example = tf.train.SequenceExample()
+    example.ParseFromString(raw_record.numpy())
+    
+    # Read multi-hot label from context
+    if 'clip/label/multi_hot' in example.context.feature:
+      label_floats = example.context.feature['clip/label/multi_hot'].float_list.value
+      labels.append(np.array(label_floats, dtype=np.float32))
+    else:
+      raise ValueError(f'No clip/label/multi_hot found in {tfrecord_path}')
+  
+  return labels
+
+
 def create_test_dataset(config: ml_collections.ConfigDict):
-  """Create test dataset iterator."""
+  """Create test dataset iterator with labels read separately."""
   logging.info('Creating test dataset...')
   
   import glob
@@ -89,11 +119,15 @@ def create_test_dataset(config: ml_collections.ConfigDict):
   
   logging.info(f'Found {len(tfrecord_files)} TFRecord files')
   
+  # Sort for deterministic order
+  tfrecord_files.sort()
+  
   tfrecord_files_relative = [os.path.relpath(f, FLAGS.test_data_dir) for f in tfrecord_files]
   
   # Determine number of samples
   num_samples = FLAGS.num_samples if FLAGS.num_samples else 100000  # Large number if None
   
+  # Create dataset WITHOUT labels (we'll read them separately)
   ds_factory = functools.partial(
       audiovisual_tfrecord_dataset.AVTFRecordDatasetFactory,
       base_dir=FLAGS.test_data_dir,
@@ -106,7 +140,7 @@ def create_test_dataset(config: ml_collections.ConfigDict):
   
   dataset, num_examples = audiovisual_tfrecord_dataset.load_split_from_dmvr(
       ds_factory=ds_factory,
-      batch_size=1,
+      batch_size=FLAGS.batch_size,  # Use configurable batch size
       subset='test',
       modalities=('spectrogram', 'rgb'),
       num_frames=config.dataset_configs.num_frames,
@@ -139,7 +173,9 @@ def create_test_dataset(config: ml_collections.ConfigDict):
       dataset_iter)
   
   logging.info(f'Dataset created with {num_examples} examples')
-  return dataset_iter, num_examples
+  
+  # Return both dataset iterator and tfrecord file paths for label reading
+  return dataset_iter, num_examples, tfrecord_files
 
 
 def load_checkpoint(config: ml_collections.ConfigDict, checkpoint_dir: str):
@@ -228,6 +264,19 @@ def extract_with_intermediates(model_instance, params, model_state, inputs):
   }
 
 
+# JIT-compile the forward pass for speed
+@jax.jit
+def forward_pass_jit(params, model_state, inputs):
+  """JIT-compiled forward pass (faster after first compilation)."""
+  variables = {'params': params}
+  if model_state:
+    variables['batch_stats'] = model_state
+  
+  # Note: We can't capture intermediates in JIT mode, so this is just for the forward pass
+  # We'll use the non-JIT version when we need intermediates
+  return None  # Placeholder - we'll use extract_with_intermediates instead
+
+
 def filter_essential_activations(activations: Dict) -> Dict:
   """Filter to keep only encoder block outputs and optionally attention.
   
@@ -304,52 +353,180 @@ def filter_essential_activations(activations: Dict) -> Dict:
   return essential
 
 
+def save_checkpoint(accumulator, processed_count, output_dir, checkpoint_name='checkpoint.pkl'):
+  """Save intermediate checkpoint."""
+  checkpoint_path = os.path.join(output_dir, checkpoint_name)
+  
+  # Convert nested defaultdicts to regular dicts for pickling
+  sums_dict = {}
+  for class_idx, activations in accumulator.sums.items():
+    sums_dict[class_idx] = dict(activations)  # Convert inner defaultdict to dict
+  
+  checkpoint_data = {
+      'processed_count': processed_count,
+      'sums': sums_dict,
+      'counts': dict(accumulator.counts),
+      'num_classes': accumulator.num_classes
+  }
+  with open(checkpoint_path, 'wb') as f:
+    pickle.dump(checkpoint_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+  
+  # Immediately delete temporary copies to free memory
+  del sums_dict
+  del checkpoint_data
+  
+  # Sync to disk and drop OS caches
+  os.sync()
+  try:
+    # Drop OS page cache, dentries, inodes
+    with open('/proc/sys/vm/drop_caches', 'w') as f:
+      f.write('3')  # 3 = drop everything (pagecache, dentries, inodes)
+    logging.info(f'  Saved checkpoint to {checkpoint_path} and dropped OS caches')
+  except PermissionError:
+    logging.info(f'  Saved checkpoint to {checkpoint_path} (no permission to drop OS caches)')
+  except Exception as e:
+    logging.info(f'  Saved checkpoint to {checkpoint_path} (could not drop OS caches: {e})')
+
+
+def load_checkpoint_if_exists(output_dir, num_classes, checkpoint_name='checkpoint.pkl'):
+  """Load checkpoint if it exists.
+  
+  Returns:
+      (accumulator, processed_count) or (None, 0) if no checkpoint
+  """
+  checkpoint_path = os.path.join(output_dir, checkpoint_name)
+  
+  if not os.path.exists(checkpoint_path):
+    return None, 0
+  
+  try:
+    with open(checkpoint_path, 'rb') as f:
+      checkpoint_data = pickle.load(f)
+    
+    # Recreate accumulator from checkpoint
+    accumulator = ClassAccumulator(num_classes)
+    
+    # Reconstruct the nested defaultdict structure from regular dicts
+    # Also compact arrays by copying them to fresh memory (defragmentation)
+    logging.info('Compacting accumulated arrays to defragment memory...')
+    for class_idx, activations_dict in checkpoint_data['sums'].items():
+      for act_name, act_value in activations_dict.items():
+        # Copy to fresh contiguous memory block to defragment
+        accumulator.sums[class_idx][act_name] = np.array(act_value, copy=True, dtype=np.float32)
+    
+    accumulator.counts = defaultdict(int, checkpoint_data['counts'])
+    processed_count = checkpoint_data['processed_count']
+    
+    logging.info(f'Loaded checkpoint from {checkpoint_path}')
+    logging.info(f'  Resuming from sample {processed_count}')
+    logging.info(f'  Already accumulated {len(accumulator.counts)} classes')
+    
+    return accumulator, processed_count
+  except Exception as e:
+    logging.warning(f'Failed to load checkpoint: {e}. Starting from scratch.')
+    return None, 0
+
+
 class ClassAccumulator:
-  """Accumulates activations per class for averaging."""
+  """Accumulates activations per class for averaging - stores on disk to save RAM.
   
-  def __init__(self, num_classes: int):
+  Instead of keeping all sums in memory, we store them in individual numpy files.
+  This allows the accumulator to scale to any size without RAM constraints.
+  """
+  
+  def __init__(self, num_classes: int, output_dir: str):
     self.num_classes = num_classes
-    # Store sum and count for each class
-    self.sums = defaultdict(lambda: defaultdict(lambda: None))
+    self.output_dir = output_dir
+    self.accumulation_dir = os.path.join(output_dir, '.accumulation')
+    os.makedirs(self.accumulation_dir, exist_ok=True)
+    
+    # Keep only counts in RAM (very small - just 527 integers)
     self.counts = defaultdict(int)
+    
+    # Track which activation names exist (from first batch)
+    self.activation_names = None
   
-  def add_sample(self, activations: Dict, label: np.ndarray):
-    """Add a sample's activations to all its classes.
+  def _get_sum_path(self, class_idx: int, act_name: str) -> str:
+    """Get the file path for a class activation sum."""
+    return os.path.join(self.accumulation_dir, f'class_{class_idx}_{act_name}.npy')
+  
+  def add_sample(self, activations: Dict, labels: np.ndarray):
+    """Add sample(s) activations to all their classes.
     
     Args:
       activations: Dict of activation arrays
-      label: Multi-hot label vector (shape: num_classes)
+      labels: Multi-hot label vector(s) - shape: (num_classes,) or (batch, num_classes)
     """
-    # Find which classes this sample belongs to
-    active_classes = np.where(label > 0)[0]
+    # Store activation names from first call
+    if self.activation_names is None:
+      self.activation_names = list(activations.keys())
     
-    for class_idx in active_classes:
-      class_idx = int(class_idx)
-      self.counts[class_idx] += 1
+    # Handle both single sample and batched inputs
+    if labels.ndim == 1:
+      # Single sample
+      active_classes = np.where(labels > 0)[0]
       
-      # Add activations to this class's sum
-      for act_name, act_value in activations.items():
-        if self.sums[class_idx][act_name] is None:
-          self.sums[class_idx][act_name] = np.zeros_like(act_value)
+      for class_idx in active_classes:
+        class_idx = int(class_idx)
+        self.counts[class_idx] += 1
         
-        self.sums[class_idx][act_name] += act_value
+        for act_name, act_value in activations.items():
+          sum_path = self._get_sum_path(class_idx, act_name)
+          act_value = np.asarray(act_value, dtype=np.float32)
+          
+          if os.path.exists(sum_path):
+            # Load existing sum, add to it, save back
+            existing_sum = np.load(sum_path)
+            existing_sum[:] += act_value
+            np.save(sum_path, existing_sum)
+          else:
+            # First time seeing this class - save initial sum
+            np.save(sum_path, np.array(act_value, copy=True, dtype=np.float32))
+    
+    else:
+      # Batched samples - labels shape: (batch, num_classes)
+      batch_size = labels.shape[0]
+      
+      for batch_idx in range(batch_size):
+        label = labels[batch_idx]
+        active_classes = np.where(label > 0)[0]
+        
+        for class_idx in active_classes:
+          class_idx = int(class_idx)
+          self.counts[class_idx] += 1
+          
+          for act_name, act_value in activations.items():
+            sample_activation = np.asarray(act_value[batch_idx], dtype=np.float32)
+            sum_path = self._get_sum_path(class_idx, act_name)
+            
+            if os.path.exists(sum_path):
+              # Load existing sum, add to it, save back
+              existing_sum = np.load(sum_path)
+              existing_sum[:] += sample_activation
+              np.save(sum_path, existing_sum)
+            else:
+              # First time seeing this class - save initial sum
+              np.save(sum_path, np.array(sample_activation, copy=True, dtype=np.float32))
   
   def compute_averages(self) -> Dict[int, Dict[str, np.ndarray]]:
-    """Compute average activations for each class.
+    """Compute average activations for each class by loading from disk.
     
     Returns:
       Dict mapping class_idx -> {activation_name: averaged_array}
     """
     averages = {}
     
-    for class_idx in self.sums.keys():
+    for class_idx in self.counts.keys():
       count = self.counts[class_idx]
       if count == 0:
         continue
       
       averages[class_idx] = {}
-      for act_name, act_sum in self.sums[class_idx].items():
-        averages[class_idx][act_name] = act_sum / count
+      for act_name in self.activation_names:
+        sum_path = self._get_sum_path(class_idx, act_name)
+        if os.path.exists(sum_path):
+          act_sum = np.load(sum_path)
+          averages[class_idx][act_name] = act_sum / count
     
     return averages
   
@@ -362,6 +539,13 @@ class ClassAccumulator:
         'max_samples': max(self.counts.values()) if self.counts else 0,
         'mean_samples': np.mean(list(self.counts.values())) if self.counts else 0
     }
+  
+  def cleanup_accumulation_files(self):
+    """Delete temporary accumulation files after saving final output."""
+    import shutil
+    if os.path.exists(self.accumulation_dir):
+      shutil.rmtree(self.accumulation_dir)
+      logging.info('Removed temporary accumulation files')
 
 
 def main(argv):
@@ -370,6 +554,35 @@ def main(argv):
   logging.info('='*80)
   logging.info('MBT Class-Averaged Activation Extraction')
   logging.info('='*80)
+  
+  # Clear memory caches on startup
+  logging.info('Clearing memory caches on startup...')
+  import gc
+  import subprocess
+  gc.collect()
+  gc.collect()
+  try:
+    import ctypes
+    libc = ctypes.CDLL("libc.so.6")
+    libc.malloc_trim(0)
+    logging.info('Python memory cache cleared successfully')
+  except Exception as e:
+    logging.warning(f'Could not clear Python memory cache: {e}')
+  
+  # Clear OS-level caches (pagecache, dentries, inodes)
+  logging.info('Clearing OS-level caches...')
+  try:
+    os.sync()
+    subprocess.run(['sync'], check=True)
+    # Try with sudo
+    result = subprocess.run(['sudo', 'tee', '/proc/sys/vm/drop_caches'], 
+                          input=b'3', capture_output=True)
+    if result.returncode == 0:
+      logging.info('OS caches cleared successfully')
+    else:
+      logging.warning('Could not clear OS caches (no sudo access)')
+  except Exception as e:
+    logging.warning(f'Could not clear OS caches: {e}')
   
   os.makedirs(FLAGS.output_dir, exist_ok=True)
   
@@ -391,63 +604,214 @@ def main(argv):
   
   # Create dataset
   logging.info('\n[4/5] Loading test data...')
-  dataset, num_examples = create_test_dataset(config)
+  dataset, num_examples, tfrecord_files = create_test_dataset(config)
   num_to_process = min(FLAGS.num_samples, num_examples) if FLAGS.num_samples else num_examples
+  
+  # Create label iterator (stream instead of pre-loading to save RAM)
+  logging.info('Creating label iterator from TFRecords...')
+  
+  def create_label_iterator(tfrecord_files):
+    """Generator that yields labels on-demand instead of loading all into RAM."""
+    for i, tfr_path in enumerate(tfrecord_files):
+      if (i + 1) % 10 == 0 or i == 0:
+        logging.info(f'  Streaming labels from file {i+1}/{len(tfrecord_files)}...')
+      try:
+        file_labels = read_labels_from_tfrecord(tfr_path)
+        if i == 0:
+          logging.info(f'    First file contains {len(file_labels)} samples')
+        for label in file_labels:
+          yield label
+      except Exception as e:
+        logging.warning(f'Failed to read labels from {tfr_path}: {e}')
+        continue
+  
+  # Create iterator instead of list
+  label_iterator = create_label_iterator(tfrecord_files)
+  
+  logging.info(f'Label iterator created (streaming from {len(tfrecord_files)} TFRecord files)')
+  logging.info(f'Will process up to {num_to_process} samples from dataset')
+  logging.info('Note: Using label streaming to minimize RAM usage')
   
   # Initialize accumulator
   logging.info(f'\n[5/5] Processing {num_to_process} samples and accumulating by class...')
-  accumulator = ClassAccumulator(num_classes)
+  logging.info(f'Using batch size: {FLAGS.batch_size}')
   
-  processed_count = 0
+  # Initialize accumulator with disk storage
+  accumulator = ClassAccumulator(num_classes, FLAGS.output_dir)
   
-  for sample_idx, batch in enumerate(dataset):
-    if sample_idx >= num_to_process:
+  # Try to resume from checkpoint
+  if FLAGS.resume_from_checkpoint:
+    _, processed_count = load_checkpoint_if_exists(FLAGS.output_dir, num_classes)
+    if processed_count == 0:
+      logging.info('No checkpoint found, starting from beginning')
+    else:
+      # Load counts from checkpoint
+      checkpoint_path = os.path.join(FLAGS.output_dir, 'checkpoint.pkl')
+      with open(checkpoint_path, 'rb') as f:
+        checkpoint_data = pickle.load(f)
+      accumulator.counts = defaultdict(int, checkpoint_data['counts'])
+      
+      # Skip ahead in label iterator to resume point
+      logging.info(f'Skipping {processed_count} labels to resume from checkpoint...')
+      for _ in range(processed_count):
+        try:
+          next(label_iterator)
+        except StopIteration:
+          logging.error('Label iterator exhausted while trying to skip to checkpoint position!')
+          break
+      logging.info(f'Resumed from checkpoint at sample {processed_count}')
+  else:
+    processed_count = 0
+    logging.info('Checkpoint resume disabled, starting from beginning')
+  
+  # Calculate starting batch count from processed samples
+  batch_count = processed_count // FLAGS.batch_size
+  start_time = time.time()
+  
+  for batch_idx, batch in enumerate(dataset):
+    if processed_count >= num_to_process:
       break
     
-    if processed_count % 100 == 0:
-      logging.info(f'  Processed {processed_count}/{num_to_process} samples...')
+    batch_start_time = time.time()
+    
+    current_batch_size = batch['inputs']['rgb'].shape[0] if 'rgb' in batch['inputs'] else batch['inputs']['spectrogram'].shape[0]
+    
+    # Calculate which sample indices this batch contains
+    batch_start_idx = batch_idx * FLAGS.batch_size
+    batch_end_idx = batch_start_idx + current_batch_size
+    
+    # Skip if we've already processed this batch (resuming from checkpoint)
+    if batch_end_idx <= processed_count:
+      continue
+    
+    # Partial skip: some samples in this batch were already processed
+    if batch_start_idx < processed_count < batch_end_idx:
+      skip_samples = processed_count - batch_start_idx
+      for key in batch['inputs']:
+        batch['inputs'][key] = batch['inputs'][key][skip_samples:]
+      current_batch_size -= skip_samples
+      batch_start_idx = processed_count
+    
+    if processed_count + current_batch_size > num_to_process:
+      # Trim the last batch if it exceeds num_to_process
+      samples_to_take = num_to_process - processed_count
+      for key in batch['inputs']:
+        batch['inputs'][key] = batch['inputs'][key][:samples_to_take]
+      current_batch_size = samples_to_take
+    
+    # Log progress for every batch with timing
+    elapsed = time.time() - start_time
+    samples_per_sec = processed_count / elapsed if elapsed > 0 else 0
+    eta_seconds = (num_to_process - processed_count) / samples_per_sec if samples_per_sec > 0 else 0
+    eta_str = f"{int(eta_seconds // 3600)}h {int((eta_seconds % 3600) // 60)}m" if eta_seconds > 0 else "calculating..."
+    
+    logging.info(f'Batch {batch_count}: Processing samples {processed_count}-{processed_count + current_batch_size}/{num_to_process} | Speed: {samples_per_sec:.2f} samples/sec | ETA: {eta_str}')
     
     try:
       inputs = batch['inputs']
-      labels = batch['label'].squeeze()  # Multi-hot label vector
       
-      # Extract activations
+      # Get labels for this batch from iterator (streaming, not pre-loaded)
+      batch_labels = []
+      for i in range(current_batch_size):
+        try:
+          label = next(label_iterator)
+          batch_labels.append(label)
+        except StopIteration:
+          # Ran out of labels - shouldn't happen but handle gracefully
+          logging.warning(f'Label iterator exhausted at sample {processed_count + i}. Using zero vector.')
+          batch_labels.append(np.zeros(num_classes, dtype=np.float32))
+      
+      batch_labels = np.array(batch_labels)
+      
+      # Extract activations for the batch
       result = extract_with_intermediates(model_instance, params, model_state, inputs)
       
-      # Filter to essential activations
-      essential = filter_essential_activations(result['activations'])
+      # Filter to essential activations (convert JAX arrays to numpy immediately)
+      essential_jax = filter_essential_activations(result['activations'])
       
-      # Remove batch dimension (we process one at a time)
-      for key in essential:
-        if essential[key].ndim > 0 and essential[key].shape[0] == 1:
-          essential[key] = essential[key][0]
+      # Convert JAX DeviceArrays to numpy arrays to free device memory
+      essential = {}
+      for key, value in essential_jax.items():
+        essential[key] = np.array(value)  # Force copy to host memory
+      del essential_jax
       
-      # Add to accumulator
-      accumulator.add_sample(essential, labels)
+      # Immediately delete the full activations dict to free memory
+      del result
       
-      processed_count += 1
-      
-      # Log first sample info
-      if sample_idx == 0:
-        logging.info(f'\nFirst sample activations:')
+      # Log first batch info BEFORE deleting
+      if batch_idx == 0:
+        logging.info('\nFirst batch activations:')
         for name, value in essential.items():
           logging.info(f'  {name}: shape {value.shape}, size {value.nbytes / 1024**2:.1f} MB')
         
-        active_classes = np.where(labels > 0)[0]
+        logging.info('\nFirst batch label info:')
+        logging.info(f'  Labels shape: {batch_labels.shape}')
+        logging.info(f'  Labels dtype: {batch_labels.dtype}')
+        logging.info(f'  First sample - sum: {batch_labels[0].sum()}, active: {np.where(batch_labels[0] > 0)[0]}')
+        
+        active_classes = np.where(batch_labels[0] > 0)[0]
         logging.info(f'\nFirst sample has {len(active_classes)} active classes:')
-        for class_idx in active_classes[:5]:  # Show first 5
+        for class_idx in active_classes[:5]:
           logging.info(f'  - {index_to_name[class_idx]}')
       
-      # Clear JAX cache periodically
-      if processed_count % FLAGS.clear_cache_every == 0:
+      # Add batch to accumulator (handles batch dimension internally)
+      accumulator.add_sample(essential, batch_labels)
+      
+      # Delete ALL batch data immediately after processing to free RAM
+      del batch_labels
+      del essential
+      del inputs
+      del batch  # Delete the entire batch dict including inputs
+      
+      # Force immediate garbage collection after deleting batch data
+      import gc
+      gc.collect()
+      
+      processed_count += current_batch_size
+      batch_count += 1
+      
+      batch_time = time.time() - batch_start_time
+      logging.info(f'  → Batch completed in {batch_time:.1f}s ({current_batch_size / batch_time:.2f} samples/sec)')
+      
+      # Clear JAX cache and run garbage collection MORE aggressively
+      if batch_count % FLAGS.clear_cache_every == 0:
         jax.clear_caches()
         import gc
         gc.collect()
+        # Force Python to release memory back to OS
+        try:
+          import ctypes
+          libc = ctypes.CDLL("libc.so.6")
+          libc.malloc_trim(0)
+        except Exception:
+          pass  # malloc_trim not available on all systems
+      
+      # Save checkpoint periodically
+      if FLAGS.checkpoint_every > 0 and batch_count % FLAGS.checkpoint_every == 0 and batch_count > 0:
+        save_checkpoint(accumulator, processed_count, FLAGS.output_dir)
+        # Aggressively clean up memory after checkpoint
+        import gc
+        gc.collect()
+        gc.collect()  # Run twice to clean up cyclic references
+        # Force return memory to OS
+        try:
+          import ctypes
+          libc = ctypes.CDLL("libc.so.6")
+          libc.malloc_trim(0)
+        except Exception:
+          pass
     
     except Exception as e:
-      logging.error(f'ERROR processing sample {sample_idx}: {e}')
+      logging.error(f'ERROR processing batch {batch_idx}: {e}')
       import traceback
       logging.error(traceback.format_exc())
+      
+      # Save emergency checkpoint on error
+      if FLAGS.checkpoint_every > 0:
+        logging.info('Saving emergency checkpoint before continuing...')
+        save_checkpoint(accumulator, processed_count, FLAGS.output_dir, 'checkpoint_emergency.pkl')
+      
+      processed_count += current_batch_size
       continue
   
   # Compute averages
@@ -468,8 +832,6 @@ def main(argv):
   total_size = 0
   
   for class_idx, activations in class_averages.items():
-    class_name = index_to_name.get(class_idx, f'class_{class_idx}')
-    
     for act_name, act_value in activations.items():
       key = f'class_{class_idx}_{act_name}'
       save_dict[key] = act_value
@@ -486,6 +848,20 @@ def main(argv):
   logging.info(f'  Total size: {total_size / (1024**3):.2f} GB')
   
   np.savez_compressed(output_path, **save_dict)
+  
+  # Clean up temporary accumulation files
+  accumulator.cleanup_accumulation_files()
+  
+  # Clean up checkpoint files after successful completion
+  if FLAGS.checkpoint_every > 0:
+    checkpoint_path = os.path.join(FLAGS.output_dir, 'checkpoint.pkl')
+    emergency_checkpoint_path = os.path.join(FLAGS.output_dir, 'checkpoint_emergency.pkl')
+    if os.path.exists(checkpoint_path):
+      os.remove(checkpoint_path)
+      logging.info('Removed checkpoint file (no longer needed)')
+    if os.path.exists(emergency_checkpoint_path):
+      os.remove(emergency_checkpoint_path)
+      logging.info('Removed emergency checkpoint file (no longer needed)')
   
   # Save detailed class statistics
   class_stats = []
