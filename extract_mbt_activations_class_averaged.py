@@ -54,7 +54,7 @@ flags.DEFINE_integer('batch_size', 4, 'Batch size for processing (higher = faste
 flags.DEFINE_bool('average_attention_heads', True, 'Average attention over heads to reduce size')
 flags.DEFINE_integer('clear_cache_every', 1, 'Clear JAX cache every N samples')
 flags.DEFINE_bool('save_attention', False, 'Save attention weights (increases storage significantly)')
-flags.DEFINE_integer('checkpoint_every', 50, 'Save intermediate checkpoint every N batches (0 = disable)')
+flags.DEFINE_integer('checkpoint_every', 1, 'Save intermediate checkpoint every N batches (0 = disable)')
 flags.DEFINE_bool('resume_from_checkpoint', True, 'Resume from checkpoint if it exists')
 
 flags.mark_flag_as_required('config')
@@ -354,25 +354,20 @@ def filter_essential_activations(activations: Dict) -> Dict:
 
 
 def save_checkpoint(accumulator, processed_count, output_dir, checkpoint_name='checkpoint.pkl'):
-  """Save intermediate checkpoint."""
+  """Save intermediate checkpoint with only counts (activation sums are already on disk)."""
   checkpoint_path = os.path.join(output_dir, checkpoint_name)
   
-  # Convert nested defaultdicts to regular dicts for pickling
-  sums_dict = {}
-  for class_idx, activations in accumulator.sums.items():
-    sums_dict[class_idx] = dict(activations)  # Convert inner defaultdict to dict
-  
+  # Only save counts and processed count (sums are stored on disk in .accumulation/)
   checkpoint_data = {
       'processed_count': processed_count,
-      'sums': sums_dict,
       'counts': dict(accumulator.counts),
-      'num_classes': accumulator.num_classes
+      'num_classes': accumulator.num_classes,
+      'activation_names': accumulator.activation_names
   }
   with open(checkpoint_path, 'wb') as f:
     pickle.dump(checkpoint_data, f, protocol=pickle.HIGHEST_PROTOCOL)
   
-  # Immediately delete temporary copies to free memory
-  del sums_dict
+  # Immediately delete temporary copy to free memory
   del checkpoint_data
   
   # Sync to disk and drop OS caches
@@ -389,42 +384,31 @@ def save_checkpoint(accumulator, processed_count, output_dir, checkpoint_name='c
 
 
 def load_checkpoint_if_exists(output_dir, num_classes, checkpoint_name='checkpoint.pkl'):
-  """Load checkpoint if it exists.
+  """Load checkpoint if it exists. Activation sums remain on disk.
   
   Returns:
-      (accumulator, processed_count) or (None, 0) if no checkpoint
+      processed_count or 0 if no checkpoint
   """
   checkpoint_path = os.path.join(output_dir, checkpoint_name)
   
   if not os.path.exists(checkpoint_path):
-    return None, 0
+    return 0
   
   try:
     with open(checkpoint_path, 'rb') as f:
       checkpoint_data = pickle.load(f)
     
-    # Recreate accumulator from checkpoint
-    accumulator = ClassAccumulator(num_classes)
-    
-    # Reconstruct the nested defaultdict structure from regular dicts
-    # Also compact arrays by copying them to fresh memory (defragmentation)
-    logging.info('Compacting accumulated arrays to defragment memory...')
-    for class_idx, activations_dict in checkpoint_data['sums'].items():
-      for act_name, act_value in activations_dict.items():
-        # Copy to fresh contiguous memory block to defragment
-        accumulator.sums[class_idx][act_name] = np.array(act_value, copy=True, dtype=np.float32)
-    
-    accumulator.counts = defaultdict(int, checkpoint_data['counts'])
     processed_count = checkpoint_data['processed_count']
     
     logging.info(f'Loaded checkpoint from {checkpoint_path}')
     logging.info(f'  Resuming from sample {processed_count}')
-    logging.info(f'  Already accumulated {len(accumulator.counts)} classes')
+    logging.info(f'  Already accumulated {len(checkpoint_data["counts"])} classes')
+    logging.info(f'  Activation sums remain on disk in .accumulation/')
     
-    return accumulator, processed_count
+    return processed_count
   except Exception as e:
     logging.warning(f'Failed to load checkpoint: {e}. Starting from scratch.')
-    return None, 0
+    return 0
 
 
 class ClassAccumulator:
@@ -475,13 +459,15 @@ class ClassAccumulator:
           act_value = np.asarray(act_value, dtype=np.float32)
           
           if os.path.exists(sum_path):
+            print("skipped")
             # Load existing sum, add to it, save back
-            existing_sum = np.load(sum_path)
-            existing_sum[:] += act_value
-            np.save(sum_path, existing_sum)
+            #existing_sum = np.load(sum_path)
+            #existing_sum[:] += act_value
+            #np.save(sum_path, existing_sum)
           else:
             # First time seeing this class - save initial sum
-            np.save(sum_path, np.array(act_value, copy=True, dtype=np.float32))
+            print("skipped")
+            #np.save(sum_path, np.array(act_value, copy=True, dtype=np.float32))
     
     else:
       # Batched samples - labels shape: (batch, num_classes)
@@ -500,13 +486,15 @@ class ClassAccumulator:
             sum_path = self._get_sum_path(class_idx, act_name)
             
             if os.path.exists(sum_path):
+              print("skipped")
               # Load existing sum, add to it, save back
-              existing_sum = np.load(sum_path)
-              existing_sum[:] += sample_activation
-              np.save(sum_path, existing_sum)
+              # existing_sum = np.load(sum_path)
+              # existing_sum[:] += sample_activation
+              # np.save(sum_path, existing_sum)
             else:
+              print("skipped")
               # First time seeing this class - save initial sum
-              np.save(sum_path, np.array(sample_activation, copy=True, dtype=np.float32))
+              #np.save(sum_path, np.array(sample_activation, copy=True, dtype=np.float32))
   
   def compute_averages(self) -> Dict[int, Dict[str, np.ndarray]]:
     """Compute average activations for each class by loading from disk.
@@ -541,11 +529,16 @@ class ClassAccumulator:
     }
   
   def cleanup_accumulation_files(self):
-    """Delete temporary accumulation files after saving final output."""
-    import shutil
-    if os.path.exists(self.accumulation_dir):
-      shutil.rmtree(self.accumulation_dir)
-      logging.info('Removed temporary accumulation files')
+    """Delete temporary accumulation files after saving final output.
+    
+    NOTE: Currently disabled to preserve .accumulation files for inspection.
+    """
+    # Accumulation files now preserved for debugging/inspection
+    logging.info('Keeping .accumulation directory (cleanup disabled)')
+    # import shutil
+    # if os.path.exists(self.accumulation_dir):
+    #   shutil.rmtree(self.accumulation_dir)
+    #   logging.info('Removed temporary accumulation files')
 
 
 def main(argv):
@@ -641,15 +634,16 @@ def main(argv):
   
   # Try to resume from checkpoint
   if FLAGS.resume_from_checkpoint:
-    _, processed_count = load_checkpoint_if_exists(FLAGS.output_dir, num_classes)
+    processed_count = load_checkpoint_if_exists(FLAGS.output_dir, num_classes)
     if processed_count == 0:
       logging.info('No checkpoint found, starting from beginning')
     else:
-      # Load counts from checkpoint
+      # Load counts and activation names from checkpoint
       checkpoint_path = os.path.join(FLAGS.output_dir, 'checkpoint.pkl')
       with open(checkpoint_path, 'rb') as f:
         checkpoint_data = pickle.load(f)
       accumulator.counts = defaultdict(int, checkpoint_data['counts'])
+      accumulator.activation_names = checkpoint_data.get('activation_names', None)
       
       # Skip ahead in label iterator to resume point
       logging.info(f'Skipping {processed_count} labels to resume from checkpoint...')
@@ -813,107 +807,142 @@ def main(argv):
       
       processed_count += current_batch_size
       continue
+  return None
+  # # Get stats WITHOUT loading all averages into memory
+  # stats = accumulator.get_stats()
   
-  # Compute averages
-  logging.info('\nComputing class averages...')
-  class_averages = accumulator.compute_averages()
-  stats = accumulator.get_stats()
+  # logging.info(f'\nAccumulation Statistics:')
+  # logging.info(f'  Classes with samples: {stats["num_classes_with_samples"]}/{num_classes}')
+  # logging.info(f'  Samples per class - min: {stats["min_samples"]}, max: {stats["max_samples"]}, mean: {stats["mean_samples"]:.1f}')
   
-  logging.info(f'\nAccumulation Statistics:')
-  logging.info(f'  Classes with samples: {stats["num_classes_with_samples"]}/{num_classes}')
-  logging.info(f'  Samples per class - min: {stats["min_samples"]}, max: {stats["max_samples"]}, mean: {stats["mean_samples"]:.1f}')
+  # # Save class-averaged activations streaming to avoid OOM
+  # # NOTE: We don't load all data into memory at once because ~88GB >> 62GB RAM
+  # logging.info('\nSaving class-averaged activations (streaming to avoid OOM)...')
+  # output_path = os.path.join(FLAGS.output_dir, 'class_averaged_activations.npz')
   
-  # Save class-averaged activations
-  logging.info('\nSaving class-averaged activations...')
-  output_path = os.path.join(FLAGS.output_dir, 'class_averaged_activations.npz')
+  # # Instead of using np.savez_compressed with a dict (which loads everything),
+  # # we'll write incrementally using a context manager approach
+  # # Unfortunately np.savez doesn't support streaming, so we'll use zarr or save to individual files
   
-  # Prepare save dict with flattened keys: class_0_encoder_block_L0_rgb_output, etc.
-  save_dict = {}
-  total_size = 0
+  # # OPTION 1: Save each class as separate file (best for memory)
+  # # This is the most memory-efficient approach
+
+  # averaged_dir = os.path.join(FLAGS.output_dir, 'averaged_activations')
+  # os.makedirs(averaged_dir, exist_ok=True)
   
-  for class_idx, activations in class_averages.items():
-    for act_name, act_value in activations.items():
-      key = f'class_{class_idx}_{act_name}'
-      save_dict[key] = act_value
-      total_size += act_value.nbytes
+  # total_size = 0
+  # count = 0
   
-  # Add metadata
-  save_dict['class_names'] = np.array([index_to_name.get(i, '') for i in range(num_classes)], dtype=object)
-  save_dict['class_mids'] = np.array([index_to_mid.get(i, '') for i in range(num_classes)], dtype=object)
-  save_dict['samples_per_class'] = np.array([stats['samples_per_class'].get(i, 0) for i in range(num_classes)])
-  save_dict['num_classes'] = num_classes
-  save_dict['num_samples_processed'] = processed_count
+  # # Copy .npy files from accumulation and divide by counts on-the-fly
+  # for class_idx in sorted(accumulator.counts.keys()):
+  #   count_val = accumulator.counts[class_idx]
+    
+  #   for act_name in accumulator.activation_names:
+  #     sum_path = accumulator._get_sum_path(class_idx, act_name)
+  #     if os.path.exists(sum_path):
+  #       # Load individual sum, divide by count, save to output
+  #       act_sum = np.load(sum_path)
+  #       avg_act = act_sum / count_val
+        
+  #       # Save averaged version
+  #       avg_path = os.path.join(averaged_dir, f'class_{class_idx}_{act_name}.npy')
+  #       np.save(avg_path, avg_act)
+  #       total_size += avg_act.nbytes
+  #       count += 1
+        
+  #       if count % 1000 == 0:
+  #         logging.info(f'  Saved {count} averaged activations')
+        
+  #       # Clean up to free memory
+  #       del act_sum, avg_act
   
-  logging.info(f'  Total arrays to save: {len([k for k in save_dict.keys() if k.startswith("class_")])}')
-  logging.info(f'  Total size: {total_size / (1024**3):.2f} GB')
+  # logging.info(f'  Saved {count} averaged activations')
+  # logging.info(f'  Total size: {total_size / (1024**3):.2f} GB')
+  # logging.info(f'  Location: {averaged_dir}/')
   
-  np.savez_compressed(output_path, **save_dict)
+  # # Also create a metadata file for easy loading
+  # metadata_for_averages = {
+  #     'class_names': np.array([index_to_name.get(i, '') for i in range(num_classes)], dtype=object),
+  #     'class_mids': np.array([index_to_mid.get(i, '') for i in range(num_classes)], dtype=object),
+  #     'samples_per_class': np.array([stats['samples_per_class'].get(i, 0) for i in range(num_classes)]),
+  #     'num_classes': num_classes,
+  #     'num_samples_processed': processed_count,
+  #     'activation_names': accumulator.activation_names,
+  #     'class_indices_with_samples': sorted(list(accumulator.counts.keys()))
+  # }
+  # metadata_path = os.path.join(averaged_dir, 'metadata.pkl')
+  # with open(metadata_path, 'wb') as f:
+  #   pickle.dump(metadata_for_averages, f)
   
-  # Clean up temporary accumulation files
-  accumulator.cleanup_accumulation_files()
+  # logging.info(f'  Saved metadata to {metadata_path}')
   
-  # Clean up checkpoint files after successful completion
-  if FLAGS.checkpoint_every > 0:
-    checkpoint_path = os.path.join(FLAGS.output_dir, 'checkpoint.pkl')
-    emergency_checkpoint_path = os.path.join(FLAGS.output_dir, 'checkpoint_emergency.pkl')
-    if os.path.exists(checkpoint_path):
-      os.remove(checkpoint_path)
-      logging.info('Removed checkpoint file (no longer needed)')
-    if os.path.exists(emergency_checkpoint_path):
-      os.remove(emergency_checkpoint_path)
-      logging.info('Removed emergency checkpoint file (no longer needed)')
+  # # Keep temporary accumulation files (do NOT delete)
+  # # accumulator.cleanup_accumulation_files()  # Disabled to preserve .accumulation files
+  # logging.info('Keeping .accumulation directory for inspection/debugging')
   
-  # Save detailed class statistics
-  class_stats = []
-  for class_idx in range(num_classes):
-    count = stats['samples_per_class'].get(class_idx, 0)
-    class_stats.append({
-        'index': class_idx,
-        'mid': index_to_mid.get(class_idx, ''),
-        'display_name': index_to_name.get(class_idx, ''),
-        'num_samples': count
-    })
+  # # Clean up checkpoint files after successful completion
+  # # if FLAGS.checkpoint_every > 0:
+  # #   checkpoint_path = os.path.join(FLAGS.output_dir, 'checkpoint.pkl')
+  # #   emergency_checkpoint_path = os.path.join(FLAGS.output_dir, 'checkpoint_emergency.pkl')
+  # #   if os.path.exists(checkpoint_path):
+  # #     os.remove(checkpoint_path)
+  # #     logging.info('Removed checkpoint file (no longer needed)')
+  # #   if os.path.exists(emergency_checkpoint_path):
+  # #     os.remove(emergency_checkpoint_path)
+  # #     logging.info('Removed emergency checkpoint file (no longer needed)')
+  # # Checkpoint not removed to preserve resumption ability.
+
+  # # Save detailed class statistics
+  # class_stats = []
+  # for class_idx in range(num_classes):
+  #   count = stats['samples_per_class'].get(class_idx, 0)
+  #   class_stats.append({
+  #       'index': class_idx,
+  #       'mid': index_to_mid.get(class_idx, ''),
+  #       'display_name': index_to_name.get(class_idx, ''),
+  #       'num_samples': count
+  #   })
   
-  stats_df = pd.DataFrame(class_stats)
-  stats_path = os.path.join(FLAGS.output_dir, 'class_statistics.csv')
-  stats_df.to_csv(stats_path, index=False)
+  # stats_df = pd.DataFrame(class_stats)
+  # stats_path = os.path.join(FLAGS.output_dir, 'class_statistics.csv')
+  # stats_df.to_csv(stats_path, index=False)
   
-  # Save metadata
-  metadata = {
-      'checkpoint_dir': FLAGS.checkpoint_dir,
-      'test_data_dir': FLAGS.test_data_dir,
-      'num_samples_processed': processed_count,
-      'num_classes': num_classes,
-      'config': config.to_dict(),
-      'statistics': stats
-  }
-  metadata_path = os.path.join(FLAGS.output_dir, 'metadata.pkl')
-  with open(metadata_path, 'wb') as f:
-    pickle.dump(metadata, f)
+  # # Save metadata
+  # metadata = {
+  #     'checkpoint_dir': FLAGS.checkpoint_dir,
+  #     'test_data_dir': FLAGS.test_data_dir,
+  #     'num_samples_processed': processed_count,
+  #     'num_classes': num_classes,
+  #     'config': config.to_dict(),
+  #     'statistics': stats
+  # }
+  # metadata_path = os.path.join(FLAGS.output_dir, 'metadata.pkl')
+  # with open(metadata_path, 'wb') as f:
+  #   pickle.dump(metadata, f)
   
-  logging.info('\n' + '='*80)
-  logging.info('Class-Averaged Extraction Complete!')
-  logging.info(f'Processed {processed_count} samples')
-  logging.info(f'Computed averages for {stats["num_classes_with_samples"]} classes')
-  logging.info(f'Total storage: {total_size / (1024**3):.2f} GB')
-  logging.info(f'Output saved to: {output_path}')
-  logging.info('='*80)
+  # logging.info('\n' + '='*80)
+  # logging.info('Class-Averaged Extraction Complete!')
+  # logging.info(f'Processed {processed_count} samples')
+  # logging.info(f'Computed averages for {stats["num_classes_with_samples"]} classes')
+  # logging.info(f'Total storage: {total_size / (1024**3):.2f} GB')
+  # logging.info(f'Output saved to: {output_path}')
+  # logging.info('='*80)
   
-  # Print usage instructions
-  logging.info('\nTo load class-averaged activations:')
-  logging.info('  import numpy as np')
-  logging.info(f'  data = np.load("{output_path}")')
-  logging.info('  # Get activation for class 137 (Music), layer 0, RGB:')
-  logging.info('  music_L0_rgb = data["class_137_encoder_block_L0_rgb_output"]')
-  logging.info('  # Get class names:')
-  logging.info('  class_names = data["class_names"]')
-  logging.info('  samples_per_class = data["samples_per_class"]')
+  # # Print usage instructions
+  # logging.info('\nTo load class-averaged activations:')
+  # logging.info('  import numpy as np')
+  # logging.info(f'  data = np.load("{output_path}")')
+  # logging.info('  # Get activation for class 137 (Music), layer 0, RGB:')
+  # logging.info('  music_L0_rgb = data["class_137_encoder_block_L0_rgb_output"]')
+  # logging.info('  # Get class names:')
+  # logging.info('  class_names = data["class_names"]')
+  # logging.info('  samples_per_class = data["samples_per_class"]')
   
-  # Show top 10 classes by sample count
-  logging.info('\nTop 10 classes by sample count:')
-  top_classes = sorted(stats['samples_per_class'].items(), key=lambda x: x[1], reverse=True)[:10]
-  for class_idx, count in top_classes:
-    logging.info(f'  {index_to_name[class_idx]}: {count} samples')
+  # # Show top 10 classes by sample count
+  # logging.info('\nTop 10 classes by sample count:')
+  # top_classes = sorted(stats['samples_per_class'].items(), key=lambda x: x[1], reverse=True)[:10]
+  # for class_idx, count in top_classes:
+  #   logging.info(f'  {index_to_name[class_idx]}: {count} samples')
 
 
 if __name__ == '__main__':
