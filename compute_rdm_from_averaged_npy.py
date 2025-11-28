@@ -267,6 +267,7 @@ if __name__ == '__main__':
     parser.add_argument('--plot_dendrograms', action='store_true', help='Plot dendrograms in RDM plots')
     parser.add_argument('--minimal_plot', action='store_true', help='Plot only clustered RDM heatmap without axis labels or dendrograms')
     parser.add_argument('--recompute', action='store_true', help='Recompute RDMs even if output files already exist')
+    parser.add_argument('--combined', action='store_true', help='For each layer, concatenate RGB and audio activations for each class and compute a single RDM per layer')
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -276,55 +277,107 @@ if __name__ == '__main__':
     layer_to_classfiles = {}
     for f in files:
         parts = f.split('_', 2)
-        if len(parts) < 3: continue
+        if len(parts) < 3:
+            continue
         class_idx = int(parts[1])
         layer_name = parts[2].replace('.npy', '')
         layer_to_classfiles.setdefault(layer_name, []).append((class_idx, f))
+
+    # Group layers by base name (e.g., encoder_block_L0_audio, encoder_block_L0_rgb)
+    from collections import defaultdict
+    base_to_layer = defaultdict(dict)
+    for layer_name in layer_to_classfiles:
+        print(layer_name[:-7])
+        if layer_name[:-7].endswith('_audio'):
+            base = layer_name[:-13]
+            base_to_layer[base]['audio'] = layer_name
+        elif layer_name[:-7].endswith('_rgb'):
+            base = layer_name[:-11]
+            base_to_layer[base]['rgb'] = layer_name
+
     rdm_results = {}
-    for layer_name, classfiles in layer_to_classfiles.items():
-        classfiles.sort()
-        class_indices = [idx for idx, _ in classfiles]
-        rdm_npz_path = os.path.join(args.output_dir, f'rdm_{layer_name}.npz')
-        rdm_png_path = os.path.join(args.output_dir, f'rdm_{layer_name}.png')
-        if (not args.recompute) and os.path.exists(rdm_npz_path):
-            print(f'Skipping {layer_name}: {rdm_npz_path} already exists. Use --recompute to overwrite.')
-            # Optionally, still plot if PNG missing
-            if not os.path.exists(rdm_png_path):
-                data = np.load(rdm_npz_path, allow_pickle=True)
-                rdm = data['rdm']
+    print(base_to_layer.items())
+    for base, mods in base_to_layer.items():
+        # Only process if both modalities exist for this base layer
+        if args.combined and ('audio' in mods and 'rgb' in mods):
+            audio_classfiles = sorted(layer_to_classfiles[mods['audio']])
+            rgb_classfiles = sorted(layer_to_classfiles[mods['rgb']])
+            # Find common class indices
+            audio_classes = set(idx for idx, _ in audio_classfiles)
+            rgb_classes = set(idx for idx, _ in rgb_classfiles)
+            common_classes = sorted(audio_classes & rgb_classes)
+            if not common_classes:
+                continue
+            # Build concatenated activations for each class
+            activations = []
+            for idx in common_classes:
+                audio_file = [f for i, f in audio_classfiles if i == idx][0]
+                rgb_file = [f for i, f in rgb_classfiles if i == idx][0]
+                audio_act = np.load(os.path.join(args.averaged_dir, audio_file)).flatten()
+                rgb_act = np.load(os.path.join(args.averaged_dir, rgb_file)).flatten()
+                activations.append(np.concatenate([audio_act, rgb_act]))
+            activations = np.stack(activations)
+            if args.standardize:
+                activations = StandardScaler().fit_transform(activations)
+            rdm = squareform(pdist(activations, metric=args.distance_metric))
+            rdm_npz_path = os.path.join(args.output_dir, f'rdm_{base}_combined.npz')
+            rdm_png_path = os.path.join(args.output_dir, f'rdm_{base}_combined.png')
+            np.savez_compressed(
+                rdm_npz_path,
+                rdm=rdm,
+                class_indices=np.array(common_classes),
+                class_names=np.array([index_to_name.get(idx, f'Class {idx}') for idx in common_classes])
+            )
+            print(f'Saved combined RDM for {base} to {rdm_npz_path}')
+            samples_per_class = {idx: 0 for idx in common_classes}
+            plot_rdm(
+                rdm, common_classes, samples_per_class, index_to_name, f'{base}_combined',
+                rdm_png_path,
+                plot_dendrogram=args.plot_dendrograms, minimal_plot=args.minimal_plot)
+            rdm_results[f'{base}_combined'] = rdm
+        elif not args.combined:
+            # Per-modality RDMs as before
+            for modality in mods:
+                layer_name = mods[modality]
+                classfiles = sorted(layer_to_classfiles[layer_name])
+                class_indices = [idx for idx, _ in classfiles]
+                rdm_npz_path = os.path.join(args.output_dir, f'rdm_{layer_name}.npz')
+                rdm_png_path = os.path.join(args.output_dir, f'rdm_{layer_name}.png')
+                if (not args.recompute) and os.path.exists(rdm_npz_path):
+                    print(f'Skipping {layer_name}: {rdm_npz_path} already exists. Use --recompute to overwrite.')
+                    if not os.path.exists(rdm_png_path):
+                        data = np.load(rdm_npz_path, allow_pickle=True)
+                        rdm = data['rdm']
+                        samples_per_class = {idx: 0 for idx in class_indices}
+                        plot_rdm(
+                            rdm, class_indices, samples_per_class, index_to_name, layer_name,
+                            rdm_png_path,
+                            plot_dendrogram=args.plot_dendrograms, minimal_plot=args.minimal_plot)
+                    data = np.load(rdm_npz_path, allow_pickle=True)
+                    rdm_results[layer_name] = data['rdm']
+                    continue
+                activations = []
+                for idx, fname in classfiles:
+                    act = np.load(os.path.join(args.averaged_dir, fname)).flatten()
+                    activations.append(act)
+                activations = np.stack(activations)
+                if args.standardize:
+                    activations = StandardScaler().fit_transform(activations)
+                rdm = squareform(pdist(activations, metric=args.distance_metric))
+                rdm_results[layer_name] = rdm
+                np.savez_compressed(
+                    rdm_npz_path,
+                    rdm=rdm,
+                    class_indices=np.array(class_indices),
+                    class_names=np.array([index_to_name.get(idx, f'Class {idx}') for idx in class_indices])
+                )
+                print(f'Saved RDM for {layer_name} to {rdm_npz_path}')
                 samples_per_class = {idx: 0 for idx in class_indices}
                 plot_rdm(
                     rdm, class_indices, samples_per_class, index_to_name, layer_name,
                     rdm_png_path,
                     plot_dendrogram=args.plot_dendrograms, minimal_plot=args.minimal_plot)
-            # Always add to rdm_results for evolution plot
-            data = np.load(rdm_npz_path, allow_pickle=True)
-            rdm_results[layer_name] = data['rdm']
-            continue
-        activations = []
-        for idx, fname in classfiles:
-            act = np.load(os.path.join(args.averaged_dir, fname)).flatten()
-            activations.append(act)
-        activations = np.stack(activations)
-        if args.standardize:
-            activations = StandardScaler().fit_transform(activations)
-        rdm = squareform(pdist(activations, metric=args.distance_metric))
-        rdm_results[layer_name] = rdm
-        np.savez_compressed(
-            rdm_npz_path,
-            rdm=rdm,
-            class_indices=np.array(class_indices),
-            class_names=np.array([index_to_name.get(idx, f'Class {idx}') for idx in class_indices])
-        )
-        print(f'Saved RDM for {layer_name} to {rdm_npz_path}')
-        # Plot RDM
-        samples_per_class = {idx: 0 for idx in class_indices}  # If you have sample counts, fill here
-        plot_rdm(
-            rdm, class_indices, samples_per_class, index_to_name, layer_name,
-            rdm_png_path,
-            plot_dendrogram=args.plot_dendrograms, minimal_plot=args.minimal_plot)
     # Always update advanced evolution plots, even if RDMs were skipped
     if rdm_results:
+        # Use the last computed class_indices for evolution plot
         plot_dissimilarity_evolution(rdm_results, class_indices, index_to_name, args.output_dir)
-    # Plot evolution
-    plot_dissimilarity_evolution(rdm_results, class_indices, index_to_name, args.output_dir)

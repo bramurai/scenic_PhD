@@ -11,9 +11,19 @@ This shows the minimal code needed to:
 import numpy as np
 import os
 from pathlib import Path
+from absl import app, flags, logging
+import pickle   
+
+FLAGS = flags.FLAGS
+
+flags.DEFINE_string('checkpoint_path', None, 'Path to checkpoint.pkl with metadata')
+flags.DEFINE_string('accum_dir', 'audioset_analysis_AV/.accumulation', 'Path to .accumulation directory')
+
+flags.mark_flag_as_required('checkpoint_path')
+flags.mark_flag_as_required('accum_dir')
 
 # Paths
-ACCUM_DIR = Path('audioset_analysis_AV/.accumulation')
+ACCUM_DIR = Path(FLAGS.accum_dir)
 
 def load_class_activation_sum(class_idx: int, layer_name: str) -> np.ndarray:
     """Load the SUM of activations for a class at a layer."""
