@@ -14,6 +14,7 @@ build/lib/scenic/projects/knowledge_visual_language/configs/wit_retrieval_soft_g
 *.gz
 */*.mp4
 *.npz
+!Semantic_RDMs/semantic_rdm_all_classes.npz
 **/*.mp4/
 *.mp4
 **/*.mp4 
