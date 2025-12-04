@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Extract class-averaged activations from trained MBT model.
+"""Extract class-averaged activations and logits from trained MBT model.
 
 This script:
 1. Loads a trained MBT checkpoint
 2. Runs forward pass on all test samples
-3. Accumulates activations per class (handles multi-label properly)
-4. Saves only class-averaged activations (~26 GB instead of ~1.9 TB)
+3. Optionally accumulates activations per class (handles multi-label properly)
+4. Optionally extracts and saves final logits
+5. Optionally computes mean Average Precision (mAP)
+6. Saves only class-averaged data (~26 GB instead of ~1.9 TB for activations)
 
 For multi-label samples:
   - Each sample contributes to the average of ALL its classes
@@ -16,12 +18,22 @@ Storage comparison:
   - Class-averaged storage: 527 classes × ~50 MB = 26 GB (100x smaller!)
 
 Usage:
+  # Extract everything (activations, logits, and compute mAP):
   python extract_mbt_activations_class_averaged.py \
     --config=scenic/projects/mbt/configs/audioset/audioset_classification.py \
     --checkpoint_dir=mbt_base \
     --test_data_dir=Datasets/audioset_eval \
-    --output_dir=audioset_class_averaged \
+    --output_dir=audioset_analysis \
     --audioset_labels_csv=Video_csvs/audioset_labels.csv
+
+  # Extract only logits and compute mAP (no activations):
+  python extract_mbt_activations_class_averaged.py \
+    --config=... --checkpoint_dir=... --test_data_dir=... \
+    --output_dir=audioset_logits_only \
+    --audioset_labels_csv=... \
+    --nosave_activations \
+    --save_logits \
+    --compute_map
 """
 
 import os
@@ -54,6 +66,9 @@ flags.DEFINE_integer('batch_size', 4, 'Batch size for processing (higher = faste
 flags.DEFINE_bool('average_attention_heads', True, 'Average attention over heads to reduce size')
 flags.DEFINE_integer('clear_cache_every', 1, 'Clear JAX cache every N samples')
 flags.DEFINE_bool('save_attention', False, 'Save attention weights (increases storage significantly)')
+flags.DEFINE_bool('save_activations', True, 'Save encoder block activations (disable to save storage)')
+flags.DEFINE_bool('save_logits', True, 'Save final model logits')
+flags.DEFINE_bool('compute_map', True, 'Compute and report mean Average Precision (mAP)')
 flags.DEFINE_integer('checkpoint_every', 1, 'Save intermediate checkpoint every N batches (0 = disable)')
 flags.DEFINE_bool('resume_from_checkpoint', True, 'Resume from checkpoint if it exists')
 
@@ -147,17 +162,17 @@ def create_test_dataset(config: ml_collections.ConfigDict):
       stride=config.dataset_configs.stride,
       num_spec_frames=config.dataset_configs.num_spec_frames,
       spec_stride=config.dataset_configs.spec_stride,
-      num_test_clips=1,
+      num_test_clips=config.dataset_configs.get('num_test_clips', 1),
       min_resize=config.dataset_configs.min_resize,
       crop_size=config.dataset_configs.crop_size,
       spec_shape=config.dataset_configs.spec_shape,
       dataset_spec_mean=config.dataset_configs.get('spec_mean', 0.0),
       dataset_spec_stddev=config.dataset_configs.get('spec_stddev', 1.0),
-      spec_augment=False,
-      spec_augment_params=None,
-      one_hot_label=True,
-      zero_centering=True,
-      augmentation_params=None,
+      spec_augment=False,  # Always False for inference
+      spec_augment_params=None,  # Always None for inference
+      one_hot_label=config.dataset_configs.get('one_hot_labels', True),
+      zero_centering=config.dataset_configs.get('zero_centering', True),
+      augmentation_params=None,  # Always None for inference
   )
   
   from scenic.dataset_lib import dataset_utils
@@ -281,26 +296,27 @@ def filter_essential_activations(activations: Dict) -> Dict:
   """Filter to keep only encoder block outputs and optionally attention.
   
   Returns dict with keys like:
-    - encoder_block_L0_rgb_output
-    - encoder_block_L0_audio_output
+    - encoder_block_L0_rgb_output (if save_activations=True)
+    - encoder_block_L0_audio_output (if save_activations=True)
     - attention_weights_L0_rgb (if save_attention=True)
   """
   essential = {}
   
-  # Extract encoder block outputs
-  for key, value in activations.items():
-    if 'encoderblock_' in key and 'MlpBlock_0/__call__/0' in key and 'Transformer' in key:
-      parts = key.split('/')
-      for part in parts:
-        if part.startswith('encoderblock_'):
-          if '_spectrogram' in part:
-            layer_num = part.replace('encoderblock_', '').replace('_spectrogram', '')
-            name = f'encoder_block_L{layer_num}_audio_output'
-          else:
-            layer_num = part.replace('encoderblock_', '')
-            name = f'encoder_block_L{layer_num}_rgb_output'
-          essential[name] = value
-          break
+  # Extract encoder block outputs (conditional on save_activations flag)
+  if FLAGS.save_activations:
+    for key, value in activations.items():
+      if 'encoderblock_' in key and 'MlpBlock_0/__call__/0' in key and 'Transformer' in key:
+        parts = key.split('/')
+        for part in parts:
+          if part.startswith('encoderblock_'):
+            if '_spectrogram' in part:
+              layer_num = part.replace('encoderblock_', '').replace('_spectrogram', '')
+              name = f'encoder_block_L{layer_num}_audio_output'
+            else:
+              layer_num = part.replace('encoderblock_', '')
+              name = f'encoder_block_L{layer_num}_rgb_output'
+            essential[name] = value
+            break
   
   # Optionally compute attention weights
   if FLAGS.save_attention:
@@ -461,13 +477,13 @@ class ClassAccumulator:
           if os.path.exists(sum_path):
             print("skipped")
             # Load existing sum, add to it, save back
-            #existing_sum = np.load(sum_path)
-            #existing_sum[:] += act_value
-            #np.save(sum_path, existing_sum)
+            existing_sum = np.load(sum_path)
+            existing_sum[:] += act_value
+            np.save(sum_path, existing_sum)
           else:
             # First time seeing this class - save initial sum
             print("skipped")
-            #np.save(sum_path, np.array(act_value, copy=True, dtype=np.float32))
+            np.save(sum_path, np.array(act_value, copy=True, dtype=np.float32))
     
     else:
       # Batched samples - labels shape: (batch, num_classes)
@@ -488,13 +504,13 @@ class ClassAccumulator:
             if os.path.exists(sum_path):
               print("skipped")
               # Load existing sum, add to it, save back
-              # existing_sum = np.load(sum_path)
-              # existing_sum[:] += sample_activation
-              # np.save(sum_path, existing_sum)
+              existing_sum = np.load(sum_path)
+              existing_sum[:] += sample_activation
+              np.save(sum_path, existing_sum)
             else:
               print("skipped")
               # First time seeing this class - save initial sum
-              #np.save(sum_path, np.array(sample_activation, copy=True, dtype=np.float32))
+              np.save(sum_path, np.array(sample_activation, copy=True, dtype=np.float32))
   
   def compute_averages(self) -> Dict[int, Dict[str, np.ndarray]]:
     """Compute average activations for each class by loading from disk.
@@ -539,6 +555,125 @@ class ClassAccumulator:
     # if os.path.exists(self.accumulation_dir):
     #   shutil.rmtree(self.accumulation_dir)
     #   logging.info('Removed temporary accumulation files')
+
+
+class LogitsAccumulator:
+  """Accumulates logits and labels for mAP computation and class-averaged logits."""
+  
+  def __init__(self, num_classes: int, output_dir: str):
+    self.num_classes = num_classes
+    self.output_dir = output_dir
+    
+    # For mAP computation - accumulate all predictions and labels
+    self.all_logits = []
+    self.all_labels = []
+    
+    # For class-averaged logits
+    self.logit_sums = defaultdict(lambda: np.zeros(num_classes, dtype=np.float32))
+    self.logit_counts = defaultdict(int)
+  
+  def add_sample(self, logits: np.ndarray, labels: np.ndarray):
+    """Add sample logits and labels.
+    
+    Args:
+      logits: Logit predictions - shape: (batch, num_classes) or (num_classes,)
+      labels: Multi-hot label vector(s) - shape: (batch, num_classes) or (num_classes,)
+    """
+    # Handle both single sample and batched inputs
+    if labels.ndim == 1:
+      # Single sample
+      self.all_logits.append(logits)
+      self.all_labels.append(labels)
+      
+      active_classes = np.where(labels > 0)[0]
+      for class_idx in active_classes:
+        class_idx = int(class_idx)
+        self.logit_sums[class_idx] += logits
+        self.logit_counts[class_idx] += 1
+    else:
+      # Batched samples
+      batch_size = labels.shape[0]
+      self.all_logits.extend([logits[i] for i in range(batch_size)])
+      self.all_labels.extend([labels[i] for i in range(batch_size)])
+      
+      for batch_idx in range(batch_size):
+        label = labels[batch_idx]
+        logit = logits[batch_idx]
+        active_classes = np.where(label > 0)[0]
+        
+        for class_idx in active_classes:
+          class_idx = int(class_idx)
+          self.logit_sums[class_idx] += logit
+          self.logit_counts[class_idx] += 1
+  
+  def compute_map(self):
+    """Compute mean Average Precision using sklearn."""
+    from sklearn.metrics import average_precision_score
+    
+    if not self.all_logits:
+      logging.warning('No logits accumulated for mAP computation')
+      return None
+    
+    # Convert lists to arrays
+    logits_array = np.array(self.all_logits, dtype=np.float32)
+    labels_array = np.array(self.all_labels, dtype=np.float32)
+    
+    # Apply sigmoid to logits to get probabilities
+    probs = 1.0 / (1.0 + np.exp(-logits_array))
+    
+    # Compute per-class AP - store with class indices
+    aps_per_class = {}  # Maps class_idx -> AP score
+    for class_idx in range(self.num_classes):
+      y_true = labels_array[:, class_idx]
+      y_score = probs[:, class_idx]
+      
+      # Only compute AP if there are positive samples
+      if y_true.sum() > 0:
+        ap = average_precision_score(y_true, y_score)
+        aps_per_class[class_idx] = ap
+    
+    # Compute mAP (average over classes that have samples)
+    map_score = np.mean(list(aps_per_class.values())) if aps_per_class else 0.0
+    return map_score, aps_per_class
+  
+  def get_averaged_logits(self):
+    """Get class-averaged logits."""
+    averaged = {}
+    for class_idx, logit_sum in self.logit_sums.items():
+      count = self.logit_counts[class_idx]
+      if count > 0:
+        averaged[class_idx] = logit_sum / count
+    return averaged
+  
+  def save_logits(self, output_dir: str):
+    """Save all logits and labels for later analysis."""
+    logits_path = os.path.join(output_dir, 'all_logits.npz')
+    
+    logits_array = np.array(self.all_logits, dtype=np.float32)
+    labels_array = np.array(self.all_labels, dtype=np.float32)
+    
+    np.savez_compressed(logits_path, 
+                       logits=logits_array,
+                       labels=labels_array)
+    
+    logging.info(f'Saved all logits to {logits_path}')
+    logging.info(f'  Shape: {logits_array.shape}')
+    logging.info(f'  Size: {logits_array.nbytes / 1024**2:.1f} MB')
+    
+    # Also save class-averaged logits
+    averaged_logits = self.get_averaged_logits()
+    averaged_logits_path = os.path.join(output_dir, 'class_averaged_logits.npz')
+    
+    # Convert dict to arrays for saving
+    class_indices = sorted(averaged_logits.keys())
+    averaged_array = np.array([averaged_logits[idx] for idx in class_indices], dtype=np.float32)
+    
+    np.savez_compressed(averaged_logits_path,
+                       logits=averaged_array,
+                       class_indices=np.array(class_indices, dtype=np.int32))
+    
+    logging.info(f'Saved class-averaged logits to {averaged_logits_path}')
+    logging.info(f'  Shape: {averaged_array.shape}')
 
 
 def main(argv):
@@ -632,6 +767,11 @@ def main(argv):
   # Initialize accumulator with disk storage
   accumulator = ClassAccumulator(num_classes, FLAGS.output_dir)
   
+  # Initialize logits accumulator if needed
+  logits_accumulator = None
+  if FLAGS.save_logits or FLAGS.compute_map:
+    logits_accumulator = LogitsAccumulator(num_classes, FLAGS.output_dir)
+  
   # Try to resume from checkpoint
   if FLAGS.resume_from_checkpoint:
     processed_count = load_checkpoint_if_exists(FLAGS.output_dir, num_classes)
@@ -662,17 +802,30 @@ def main(argv):
   batch_count = processed_count // FLAGS.batch_size
   start_time = time.time()
   
+  # Check for potential OOM with multicrop evaluation
+  effective_batch_size = FLAGS.batch_size * config.dataset_configs.get('num_test_clips', 1)
+  if effective_batch_size > 4:
+    logging.warning('\n' + '='*80)
+    logging.warning('WARNING: Large effective batch size detected!')
+    logging.warning(f'  batch_size={FLAGS.batch_size} × num_test_clips={config.dataset_configs.get("num_test_clips", 1)} = {effective_batch_size} samples processed together')
+    logging.warning('  This may cause Out-of-Memory errors during attention computation.')
+    logging.warning('  If you encounter OOM errors, reduce --batch_size to 1')
+    logging.warning('='*80 + '\n')
+  
   for batch_idx, batch in enumerate(dataset):
     if processed_count >= num_to_process:
       break
     
     batch_start_time = time.time()
     
-    current_batch_size = batch['inputs']['rgb'].shape[0] if 'rgb' in batch['inputs'] else batch['inputs']['spectrogram'].shape[0]
+    # Get number of crops in batch (batch_size * num_test_clips)
+    num_test_clips = config.dataset_configs.get('num_test_clips', 1)
+    current_batch_size_crops = batch['inputs']['rgb'].shape[0] if 'rgb' in batch['inputs'] else batch['inputs']['spectrogram'].shape[0]
+    current_batch_size_samples = current_batch_size_crops // num_test_clips
     
-    # Calculate which sample indices this batch contains
+    # Calculate which sample indices this batch contains (in terms of actual samples, not crops)
     batch_start_idx = batch_idx * FLAGS.batch_size
-    batch_end_idx = batch_start_idx + current_batch_size
+    batch_end_idx = batch_start_idx + current_batch_size_samples
     
     # Skip if we've already processed this batch (resuming from checkpoint)
     if batch_end_idx <= processed_count:
@@ -681,17 +834,21 @@ def main(argv):
     # Partial skip: some samples in this batch were already processed
     if batch_start_idx < processed_count < batch_end_idx:
       skip_samples = processed_count - batch_start_idx
+      skip_crops = skip_samples * num_test_clips
       for key in batch['inputs']:
-        batch['inputs'][key] = batch['inputs'][key][skip_samples:]
-      current_batch_size -= skip_samples
+        batch['inputs'][key] = batch['inputs'][key][skip_crops:]
+      current_batch_size_crops -= skip_crops
+      current_batch_size_samples -= skip_samples
       batch_start_idx = processed_count
     
-    if processed_count + current_batch_size > num_to_process:
+    if processed_count + current_batch_size_samples > num_to_process:
       # Trim the last batch if it exceeds num_to_process
       samples_to_take = num_to_process - processed_count
+      crops_to_take = samples_to_take * num_test_clips
       for key in batch['inputs']:
-        batch['inputs'][key] = batch['inputs'][key][:samples_to_take]
-      current_batch_size = samples_to_take
+        batch['inputs'][key] = batch['inputs'][key][:crops_to_take]
+      current_batch_size_crops = crops_to_take
+      current_batch_size_samples = samples_to_take
     
     # Log progress for every batch with timing
     elapsed = time.time() - start_time
@@ -699,14 +856,23 @@ def main(argv):
     eta_seconds = (num_to_process - processed_count) / samples_per_sec if samples_per_sec > 0 else 0
     eta_str = f"{int(eta_seconds // 3600)}h {int((eta_seconds % 3600) // 60)}m" if eta_seconds > 0 else "calculating..."
     
-    logging.info(f'Batch {batch_count}: Processing samples {processed_count}-{processed_count + current_batch_size}/{num_to_process} | Speed: {samples_per_sec:.2f} samples/sec | ETA: {eta_str}')
+    logging.info(f'Batch {batch_count}: Processing samples {processed_count}-{processed_count + current_batch_size_samples}/{num_to_process} ({current_batch_size_crops} crops) | Speed: {samples_per_sec:.2f} samples/sec | ETA: {eta_str}')
     
     try:
       inputs = batch['inputs']
       
-      # Get labels for this batch from iterator (streaming, not pre-loaded)
+      # Handle multicrop evaluation properly
+      # num_test_clips already retrieved above
+      num_actual_samples = current_batch_size_crops // num_test_clips
+      
+      if current_batch_size_crops % num_test_clips != 0:
+        logging.warning(f'Batch size {current_batch_size_crops} not divisible by num_test_clips {num_test_clips}. Setting num_test_clips=1.')
+        num_test_clips = 1
+        num_actual_samples = current_batch_size_crops
+      
+      # Get labels for actual samples (not crops)
       batch_labels = []
-      for i in range(current_batch_size):
+      for i in range(num_actual_samples):
         try:
           label = next(label_iterator)
           batch_labels.append(label)
@@ -717,8 +883,22 @@ def main(argv):
       
       batch_labels = np.array(batch_labels)
       
-      # Extract activations for the batch
+      # Extract activations for ALL crops in the batch
       result = extract_with_intermediates(model_instance, params, model_state, inputs)
+      
+      # Average logits across crops for each sample
+      if num_test_clips > 1:
+        # Reshape logits from [batch*clips, classes] to [batch, clips, classes]
+        logits_all_crops = result['logits'].reshape(num_actual_samples, num_test_clips, -1)
+        # Average across crops (axis=1)
+        averaged_logits = np.mean(logits_all_crops, axis=1)
+        logging.info(f'  Averaged {num_test_clips} crops per sample: {logits_all_crops.shape} -> {averaged_logits.shape}')
+      else:
+        averaged_logits = result['logits']
+      
+      # Store averaged logits
+      if logits_accumulator is not None:
+        logits_accumulator.add_sample(averaged_logits, batch_labels)
       
       # Filter to essential activations (convert JAX arrays to numpy immediately)
       essential_jax = filter_essential_activations(result['activations'])
@@ -734,9 +914,10 @@ def main(argv):
       
       # Log first batch info BEFORE deleting
       if batch_idx == 0:
-        logging.info('\nFirst batch activations:')
-        for name, value in essential.items():
-          logging.info(f'  {name}: shape {value.shape}, size {value.nbytes / 1024**2:.1f} MB')
+        if essential:
+          logging.info('\nFirst batch activations:')
+          for name, value in essential.items():
+            logging.info(f'  {name}: shape {value.shape}, size {value.nbytes / 1024**2:.1f} MB')
         
         logging.info('\nFirst batch label info:')
         logging.info(f'  Labels shape: {batch_labels.shape}')
@@ -748,8 +929,9 @@ def main(argv):
         for class_idx in active_classes[:5]:
           logging.info(f'  - {index_to_name[class_idx]}')
       
-      # Add batch to accumulator (handles batch dimension internally)
-      accumulator.add_sample(essential, batch_labels)
+      # Add batch to accumulator only if activations are being saved
+      if FLAGS.save_activations and essential:
+        accumulator.add_sample(essential, batch_labels)
       
       # Delete ALL batch data immediately after processing to free RAM
       del batch_labels
@@ -761,11 +943,12 @@ def main(argv):
       import gc
       gc.collect()
       
-      processed_count += current_batch_size
+      # Increment by actual samples (not crops)
+      processed_count += num_actual_samples
       batch_count += 1
       
       batch_time = time.time() - batch_start_time
-      logging.info(f'  → Batch completed in {batch_time:.1f}s ({current_batch_size / batch_time:.2f} samples/sec)')
+      logging.info(f'  → Batch completed in {batch_time:.1f}s ({num_actual_samples / batch_time:.2f} samples/sec)')
       
       # Clear JAX cache and run garbage collection MORE aggressively
       if batch_count % FLAGS.clear_cache_every == 0:
@@ -805,144 +988,203 @@ def main(argv):
         logging.info('Saving emergency checkpoint before continuing...')
         save_checkpoint(accumulator, processed_count, FLAGS.output_dir, 'checkpoint_emergency.pkl')
       
-      processed_count += current_batch_size
+      # Increment by actual samples that would have been processed (to avoid reprocessing on resume)
+      num_test_clips = config.dataset_configs.get('num_test_clips', 1)
+      num_actual_samples_skipped = current_batch_size_crops // num_test_clips
+      logging.warning(f'Skipping {num_actual_samples_skipped} samples from failed batch (batch had {current_batch_size_crops} crops)')
+      processed_count += num_actual_samples_skipped
       continue
-  return None
-  # # Get stats WITHOUT loading all averages into memory
-  # stats = accumulator.get_stats()
-  
-  # logging.info(f'\nAccumulation Statistics:')
-  # logging.info(f'  Classes with samples: {stats["num_classes_with_samples"]}/{num_classes}')
-  # logging.info(f'  Samples per class - min: {stats["min_samples"]}, max: {stats["max_samples"]}, mean: {stats["mean_samples"]:.1f}')
-  
-  # # Save class-averaged activations streaming to avoid OOM
-  # # NOTE: We don't load all data into memory at once because ~88GB >> 62GB RAM
-  # logging.info('\nSaving class-averaged activations (streaming to avoid OOM)...')
-  # output_path = os.path.join(FLAGS.output_dir, 'class_averaged_activations.npz')
-  
-  # # Instead of using np.savez_compressed with a dict (which loads everything),
-  # # we'll write incrementally using a context manager approach
-  # # Unfortunately np.savez doesn't support streaming, so we'll use zarr or save to individual files
-  
-  # # OPTION 1: Save each class as separate file (best for memory)
-  # # This is the most memory-efficient approach
 
-  # averaged_dir = os.path.join(FLAGS.output_dir, 'averaged_activations')
-  # os.makedirs(averaged_dir, exist_ok=True)
+  # Get stats WITHOUT loading all averages into memory
+  stats = accumulator.get_stats()
   
-  # total_size = 0
-  # count = 0
+  logging.info('\nAccumulation Statistics:')
+  logging.info(f'  Classes with samples: {stats["num_classes_with_samples"]}/{num_classes}')
+  logging.info(f'  Samples per class - min: {stats["min_samples"]}, max: {stats["max_samples"]}, mean: {stats["mean_samples"]:.1f}')
   
-  # # Copy .npy files from accumulation and divide by counts on-the-fly
-  # for class_idx in sorted(accumulator.counts.keys()):
-  #   count_val = accumulator.counts[class_idx]
+  # Compute mAP if requested
+  map_score = None  # Initialize for later reporting
+  if FLAGS.compute_map and logits_accumulator is not None:
+    logging.info('\nComputing mean Average Precision (mAP)...')
+    try:
+      map_score, aps_per_class = logits_accumulator.compute_map()
+      logging.info(f'  mAP: {map_score:.4f}')
+      logging.info(f'  Number of classes with samples: {len(aps_per_class)}/{num_classes}')
+      
+      # Show top and bottom 5 classes by AP
+      if aps_per_class:
+        # Now aps_per_class is a dict mapping class_idx -> AP
+        ap_with_names = [(index_to_name[class_idx], ap) for class_idx, ap in aps_per_class.items()]
+        ap_with_names.sort(key=lambda x: x[1], reverse=True)
+        
+        logging.info('\n  Top 5 classes by AP:')
+        for name, ap in ap_with_names[:5]:
+          logging.info(f'    {name}: {ap:.4f}')
+        
+        logging.info('\n  Bottom 5 classes by AP:')
+        for name, ap in ap_with_names[-5:]:
+          logging.info(f'    {name}: {ap:.4f}')
+    except Exception as e:
+      logging.error(f'Failed to compute mAP: {e}')
+      import traceback
+      logging.error(traceback.format_exc())
+  
+  # Save logits if requested
+  if FLAGS.save_logits and logits_accumulator is not None:
+    logging.info('\nSaving logits...')
+    try:
+      logits_accumulator.save_logits(FLAGS.output_dir)
+    except Exception as e:
+      logging.error(f'Failed to save logits: {e}')
+      import traceback
+      logging.error(traceback.format_exc())
+  
+  # Save class-averaged activations streaming to avoid OOM (only if save_activations=True)
+  # NOTE: We don't load all data into memory at once because ~88GB >> 62GB RAM
+  total_size = 0  # Initialize for later reporting
+  if FLAGS.save_activations and accumulator.activation_names:
+    logging.info('\nSaving class-averaged activations (streaming to avoid OOM)...')
     
-  #   for act_name in accumulator.activation_names:
-  #     sum_path = accumulator._get_sum_path(class_idx, act_name)
-  #     if os.path.exists(sum_path):
-  #       # Load individual sum, divide by count, save to output
-  #       act_sum = np.load(sum_path)
-  #       avg_act = act_sum / count_val
-        
-  #       # Save averaged version
-  #       avg_path = os.path.join(averaged_dir, f'class_{class_idx}_{act_name}.npy')
-  #       np.save(avg_path, avg_act)
-  #       total_size += avg_act.nbytes
-  #       count += 1
-        
-  #       if count % 1000 == 0:
-  #         logging.info(f'  Saved {count} averaged activations')
-        
-  #       # Clean up to free memory
-  #       del act_sum, avg_act
-  
-  # logging.info(f'  Saved {count} averaged activations')
-  # logging.info(f'  Total size: {total_size / (1024**3):.2f} GB')
-  # logging.info(f'  Location: {averaged_dir}/')
-  
-  # # Also create a metadata file for easy loading
-  # metadata_for_averages = {
-  #     'class_names': np.array([index_to_name.get(i, '') for i in range(num_classes)], dtype=object),
-  #     'class_mids': np.array([index_to_mid.get(i, '') for i in range(num_classes)], dtype=object),
-  #     'samples_per_class': np.array([stats['samples_per_class'].get(i, 0) for i in range(num_classes)]),
-  #     'num_classes': num_classes,
-  #     'num_samples_processed': processed_count,
-  #     'activation_names': accumulator.activation_names,
-  #     'class_indices_with_samples': sorted(list(accumulator.counts.keys()))
-  # }
-  # metadata_path = os.path.join(averaged_dir, 'metadata.pkl')
-  # with open(metadata_path, 'wb') as f:
-  #   pickle.dump(metadata_for_averages, f)
-  
-  # logging.info(f'  Saved metadata to {metadata_path}')
-  
-  # # Keep temporary accumulation files (do NOT delete)
-  # # accumulator.cleanup_accumulation_files()  # Disabled to preserve .accumulation files
-  # logging.info('Keeping .accumulation directory for inspection/debugging')
-  
-  # # Clean up checkpoint files after successful completion
-  # # if FLAGS.checkpoint_every > 0:
-  # #   checkpoint_path = os.path.join(FLAGS.output_dir, 'checkpoint.pkl')
-  # #   emergency_checkpoint_path = os.path.join(FLAGS.output_dir, 'checkpoint_emergency.pkl')
-  # #   if os.path.exists(checkpoint_path):
-  # #     os.remove(checkpoint_path)
-  # #     logging.info('Removed checkpoint file (no longer needed)')
-  # #   if os.path.exists(emergency_checkpoint_path):
-  # #     os.remove(emergency_checkpoint_path)
-  # #     logging.info('Removed emergency checkpoint file (no longer needed)')
-  # # Checkpoint not removed to preserve resumption ability.
+    # Instead of using np.savez_compressed with a dict (which loads everything),
+    # we'll write incrementally using a context manager approach
+    # Unfortunately np.savez doesn't support streaming, so we'll use zarr or save to individual files
+    
+    # OPTION 1: Save each class as separate file (best for memory)
+    # This is the most memory-efficient approach
 
-  # # Save detailed class statistics
-  # class_stats = []
-  # for class_idx in range(num_classes):
-  #   count = stats['samples_per_class'].get(class_idx, 0)
-  #   class_stats.append({
-  #       'index': class_idx,
-  #       'mid': index_to_mid.get(class_idx, ''),
-  #       'display_name': index_to_name.get(class_idx, ''),
-  #       'num_samples': count
-  #   })
+    averaged_dir = os.path.join(FLAGS.output_dir, 'averaged_activations')
+    os.makedirs(averaged_dir, exist_ok=True)
+    
+    total_size = 0
+    count = 0
+    
+    # Copy .npy files from accumulation and divide by counts on-the-fly
+    for class_idx in sorted(accumulator.counts.keys()):
+      count_val = accumulator.counts[class_idx]
+      
+      for act_name in accumulator.activation_names:
+        sum_path = accumulator._get_sum_path(class_idx, act_name)
+        if os.path.exists(sum_path):
+          # Load individual sum, divide by count, save to output
+          act_sum = np.load(sum_path)
+          avg_act = act_sum / count_val
+          
+          # Save averaged version
+          avg_path = os.path.join(averaged_dir, f'class_{class_idx}_{act_name}.npy')
+          np.save(avg_path, avg_act)
+          total_size += avg_act.nbytes
+          count += 1
+          
+          if count % 1000 == 0:
+            logging.info(f'  Saved {count} averaged activations')
+          
+          # Clean up to free memory
+          del act_sum, avg_act
+    
+    logging.info(f'  Saved {count} averaged activations')
+    logging.info(f'  Total size: {total_size / (1024**3):.2f} GB')
+    logging.info(f'  Location: {averaged_dir}/')
+    
+    # Also create a metadata file for easy loading
+    metadata_for_averages = {
+        'class_names': np.array([index_to_name.get(i, '') for i in range(num_classes)], dtype=object),
+        'class_mids': np.array([index_to_mid.get(i, '') for i in range(num_classes)], dtype=object),
+        'samples_per_class': np.array([stats['samples_per_class'].get(i, 0) for i in range(num_classes)]),
+        'num_classes': num_classes,
+        'num_samples_processed': processed_count,
+        'activation_names': accumulator.activation_names,
+        'class_indices_with_samples': sorted(list(accumulator.counts.keys()))
+    }
+    metadata_path = os.path.join(averaged_dir, 'metadata.pkl')
+    with open(metadata_path, 'wb') as f:
+      pickle.dump(metadata_for_averages, f)
+    
+    logging.info(f'  Saved metadata to {metadata_path}')
+  elif not FLAGS.save_activations:
+    logging.info('\nSkipping activation saving (save_activations=False)')
   
-  # stats_df = pd.DataFrame(class_stats)
-  # stats_path = os.path.join(FLAGS.output_dir, 'class_statistics.csv')
-  # stats_df.to_csv(stats_path, index=False)
+  # Keep temporary accumulation files (do NOT delete)
+  # accumulator.cleanup_accumulation_files()  # Disabled to preserve .accumulation files
+  logging.info('Keeping .accumulation directory for inspection/debugging')
   
-  # # Save metadata
-  # metadata = {
-  #     'checkpoint_dir': FLAGS.checkpoint_dir,
-  #     'test_data_dir': FLAGS.test_data_dir,
-  #     'num_samples_processed': processed_count,
-  #     'num_classes': num_classes,
-  #     'config': config.to_dict(),
-  #     'statistics': stats
-  # }
-  # metadata_path = os.path.join(FLAGS.output_dir, 'metadata.pkl')
-  # with open(metadata_path, 'wb') as f:
-  #   pickle.dump(metadata, f)
+  # Clean up checkpoint files after successful completion
+  # if FLAGS.checkpoint_every > 0:
+  #   checkpoint_path = os.path.join(FLAGS.output_dir, 'checkpoint.pkl')
+  #   emergency_checkpoint_path = os.path.join(FLAGS.output_dir, 'checkpoint_emergency.pkl')
+  #   if os.path.exists(checkpoint_path):
+  #     os.remove(checkpoint_path)
+  #     logging.info('Removed checkpoint file (no longer needed)')
+  #   if os.path.exists(emergency_checkpoint_path):
+  #     os.remove(emergency_checkpoint_path)
+  #     logging.info('Removed emergency checkpoint file (no longer needed)')
+  # Checkpoint not removed to preserve resumption ability.
+
+  # Save detailed class statistics
+  class_stats = []
+  for class_idx in range(num_classes):
+    count = stats['samples_per_class'].get(class_idx, 0)
+    class_stats.append({
+        'index': class_idx,
+        'mid': index_to_mid.get(class_idx, ''),
+        'display_name': index_to_name.get(class_idx, ''),
+        'num_samples': count
+    })
   
-  # logging.info('\n' + '='*80)
-  # logging.info('Class-Averaged Extraction Complete!')
-  # logging.info(f'Processed {processed_count} samples')
-  # logging.info(f'Computed averages for {stats["num_classes_with_samples"]} classes')
-  # logging.info(f'Total storage: {total_size / (1024**3):.2f} GB')
-  # logging.info(f'Output saved to: {output_path}')
-  # logging.info('='*80)
+  stats_df = pd.DataFrame(class_stats)
+  stats_path = os.path.join(FLAGS.output_dir, 'class_statistics.csv')
+  stats_df.to_csv(stats_path, index=False)
   
-  # # Print usage instructions
-  # logging.info('\nTo load class-averaged activations:')
-  # logging.info('  import numpy as np')
-  # logging.info(f'  data = np.load("{output_path}")')
-  # logging.info('  # Get activation for class 137 (Music), layer 0, RGB:')
-  # logging.info('  music_L0_rgb = data["class_137_encoder_block_L0_rgb_output"]')
-  # logging.info('  # Get class names:')
-  # logging.info('  class_names = data["class_names"]')
-  # logging.info('  samples_per_class = data["samples_per_class"]')
+  # Save metadata
+  metadata = {
+      'checkpoint_dir': FLAGS.checkpoint_dir,
+      'test_data_dir': FLAGS.test_data_dir,
+      'num_samples_processed': processed_count,
+      'num_classes': num_classes,
+      'config': config.to_dict(),
+      'statistics': stats
+  }
+  metadata_path = os.path.join(FLAGS.output_dir, 'metadata.pkl')
+  with open(metadata_path, 'wb') as f:
+    pickle.dump(metadata, f)
   
-  # # Show top 10 classes by sample count
-  # logging.info('\nTop 10 classes by sample count:')
-  # top_classes = sorted(stats['samples_per_class'].items(), key=lambda x: x[1], reverse=True)[:10]
-  # for class_idx, count in top_classes:
-  #   logging.info(f'  {index_to_name[class_idx]}: {count} samples')
+  logging.info('\n' + '='*80)
+  logging.info('Class-Averaged Extraction Complete!')
+  logging.info(f'Processed {processed_count} samples')
+  logging.info(f'Computed averages for {stats["num_classes_with_samples"]} classes')
+  
+  # Report what was extracted
+  if FLAGS.save_activations and accumulator.activation_names:
+    logging.info(f'Saved activations: {len(accumulator.activation_names)} types per class')
+    logging.info(f'Total activation storage: {total_size / (1024**3):.2f} GB')
+  
+  if FLAGS.save_logits and logits_accumulator:
+    logging.info('Saved logits: all_logits.npz and class_averaged_logits.npz')
+  
+  if FLAGS.compute_map and map_score is not None:
+    logging.info(f'Model mAP: {map_score:.4f}')
+  
+  logging.info('='*80)
+  
+  # Print usage instructions
+  if FLAGS.save_activations:
+    logging.info('\nTo load class-averaged activations:')
+    logging.info('  import numpy as np')
+    averaged_dir = os.path.join(FLAGS.output_dir, 'averaged_activations')
+    logging.info(f'  # Load activation for class 137 (Music), layer 0, RGB:')
+    logging.info(f'  music_L0_rgb = np.load("{averaged_dir}/class_137_encoder_block_L0_rgb_output.npy")')
+  
+  if FLAGS.save_logits:
+    logging.info('\nTo load logits:')
+    logging.info('  import numpy as np')
+    logging.info(f'  data = np.load("{FLAGS.output_dir}/all_logits.npz")')
+    logging.info('  logits = data["logits"]  # shape: (num_samples, num_classes)')
+    logging.info('  labels = data["labels"]  # shape: (num_samples, num_classes)')
+  
+  # Show top 10 classes by sample count
+  logging.info('\nTop 10 classes by sample count:')
+  top_classes = sorted(stats['samples_per_class'].items(), key=lambda x: x[1], reverse=True)[:10]
+  for class_idx, count in top_classes:
+    logging.info(f'  {index_to_name[class_idx]}: {count} samples')
 
 
 if __name__ == '__main__':

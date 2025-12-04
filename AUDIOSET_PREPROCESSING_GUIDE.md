@@ -118,17 +118,15 @@ python create_audioset_ready.py
 ### Step 2: Preprocess Videos
 
 ```bash
-python zLabels_preprocess/download_and_preprocess.py \
-  --csv_path=Video_csvs/audioset_ready.csv \
-  --output_path=Datasets/audioset_eval_fullset \
+python download_and_preprocess.py \
+  --csv_path=Video_csvs/audioset_eval.csv \
+  --output_path=Datasets/audioset_evel_configCorrect \
+  --temp_dir=./downloaded_videos \
   --audioset_labels_csv=Video_csvs/audioset_labels.csv \
   --clip_duration=8.0 \
-  --rgb_duration=3.0 \
+  --rgb_duration=2.56 \
   --num_shards=100 \
-  --target_fps=25 \
-  --decode_audio=True \
-  --audio_sample_rate=16000 \
-  --n_mels=128
+  --keep_videos=True
 ```
 
 **Key Parameters**:

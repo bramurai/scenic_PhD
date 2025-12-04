@@ -48,24 +48,47 @@ Layers 8-11 (Fusion with bottlenecks):
 ## Quick Start
 
 ### Extract Activations (Recommended Settings)
-
 ```bash
-python extract_mbt_activations.py \
+ python extract_mbt_activations_class_averaged.py   --config=scenic/projects/mbt/configs/audioset/Inference_config.py   --checkpoint_dir=CheckPoints/MBT_AV   --test_data_dir=Datasets/audioset_eval   --output_dir=audioset_analysis_AV   --audioset_labels_csv=Video_csvs/audioset_labels.csv   --batch_size=4   --num_samples=3852   --checkpoint_every=1
+# Extract everything (default):
+python extract_mbt_activations_class_averaged.py \
+  --config=--config=scenic/projects/mbt/configs/audioset/Inference_config.py \
+  --checkpoint_dir=CheckPoints/MBT_AV \
+  --test_data_dir=Datasets/audioset_eval \
+  --output_dir=audioset_analysis_All_date \
+  --audioset_labels_csv=Video_csvs/audioset_labels.csv \
+  --batch_size=4 \
+  --num_samples=3852 \
+  --checkpoint_every=1
+
+# Extract only logits and compute mAP (no activations):
+python extract_mbt_activations_class_averaged.py \
   --config=scenic/projects/mbt/configs/audioset/Inference_config.py \
   --checkpoint_dir=CheckPoints/MBT_AV \
-  --test_data_dir=Audioset_test \
-  --output_dir=audioset_analysis_AV \
-  --num_samples=9 \
-  --average_attention_heads=True
+  --test_data_dir=Datasets/audioset_eval \
+  --output_dir=audioset_analysis_logits-mAP_date \
+  --audioset_labels_csv=Video_csvs/audioset_labels.csv \
+  --batch_size=4 \
+  --num_samples=3852 \
+  --checkpoint_every=1 \
+  --nosave_activations \
+  --save_logits \
+  --compute_map
+
+# Extract only activations (no logits or mAP):
+python extract_mbt_activations_class_averaged.py \
+  --config=... \
+  --save_activations \
+  --nosave_logits \
+  --nocompute_map
 ```
 
 ```bash
 python extract_mbt_activations.py \
   --config=scenic/projects/mbt/configs/audioset/Inference_config.py \
   --checkpoint_dir=CheckPoints/MBT_AV \
-  --test_data_dir=Datasets/audioset_eval_100 \
+  --test_data_dir=Datasets/audioset_eval \
   --output_dir=/home/labuta/Documents/Bram/scenic_PhD/audioset_analysis_AV \
-  --num_samples=85 \
   --average_attention_heads=True \
   --resume=True \
   --clear_cache_every=8
@@ -399,7 +422,6 @@ plt.savefig('cls_tokens_across_samples.png', dpi=150)
 
 plt.savefig('cls_tokens_across_samples.png', dpi=150)
 ```
-
 
 ## Troubleshooting
 

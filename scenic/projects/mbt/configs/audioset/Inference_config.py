@@ -78,7 +78,7 @@ def get_config():
   # The effective batch size per host when testing is
   # num_test_clips * test_batch_size
   config.dataset_configs.num_test_clips = 4
-  config.dataset_configs.test_batch_size = 8  # Needs to be num_local_devices
+  config.dataset_configs.test_batch_size = 1  # Needs to be num_local_devices
   config.multicrop_clips_per_device = 2
   # Leaving this empty means that a full test is done each time.
   # About 4200 / 4 = 1050 steps on a 4-host setting (ie 4x4 TPU)
@@ -114,7 +114,7 @@ def get_config():
   config.model.use_bottleneck = True
   config.model.test_with_bottlenecks = True
   config.model.share_encoder = False
-  config.model.n_bottlenecks = 4  # Checkpoint has 5 bottlenecks total (4 + 1 for token classifier)
+  config.model.n_bottlenecks = 4  # Cross-modal bottlenecks (checkpoint has 5 total internally)
   
   # Layer at which to fuse. '0' refers to early fusion, if fusion_layer is equal
   # to model.num_layers, then there is no cross-modal attention in the transformer
@@ -128,7 +128,7 @@ def get_config():
   config.model.mlp_dim = 3072
   config.model.num_layers = 12
   config.model.representation_size = None
-  config.model.classifier = 'token'  # Checkpoint was trained with token classifier, not gap
+  config.model.classifier = 'token'  # Checkpoint has 5 bottlenecks = 4 + 1 for token classifier
   config.model.attention_dropout_rate = 0.
   config.model.dropout_rate = 0.
   config.model_dtype_str = 'float32'
