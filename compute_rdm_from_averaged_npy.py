@@ -3,12 +3,14 @@
 Compute RDMs from per-class, per-layer averaged activations saved as .npy files.
 Also generates RDM plots and dissimilarity evolution plots using the same plotting functions as compute_rdm_class_averaged.py.
 
+Optoions: combined, recompute, plot_dendograms
 Usage:
   python compute_rdm_from_averaged_npy.py \
-    --averaged_dir=audioset_analysis_AV/averaged_activations \
+    --averaged_dir=audioset_analysis_test/averaged_activations \
     --labels_csv=Video_csvs/audioset_labels.csv \
-    --output_dir=RDM_from_averaged \
-    --distance_metric=correlation
+    --output_dir=RDM_test \
+    --distance_metric=correlation \
+    --minimal_plot \
 """
 
 import os

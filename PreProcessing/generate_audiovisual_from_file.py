@@ -155,6 +155,12 @@ def compute_log_mel_spectrogram(audio: np.ndarray, sample_rate: int = 16000,
                                 hop_length_ms: float = 10.0) -> np.ndarray:
     """Compute log mel spectrogram following MBT paper specifications.
     
+    From the MBT paper: "we extract log mel spectrograms with a frequency dimension 
+    of 128 computed using a 25ms Hamming window with hop length 10ms"
+    
+    However, we also apply Lingvo-specific preprocessing (preemphasis, frequency range)
+    since MBT was trained using Lingvo's audio frontend.
+    
     Args:
         audio: Audio waveform (mono).
         sample_rate: Audio sample rate.
@@ -163,36 +169,48 @@ def compute_log_mel_spectrogram(audio: np.ndarray, sample_rate: int = 16000,
         hop_length_ms: Hop length in milliseconds.
         
     Returns:
-        Log mel spectrogram of shape (time_frames, n_mels).
+        Linear-scale mel spectrogram of shape (time_frames, n_mels).
     """
     if librosa is None:
         raise ImportError("librosa is required for spectrogram extraction. "
                          "Install with: pip install librosa")
     
-    # Convert ms to samples
-    win_length = int(win_length_ms * sample_rate / 1000)
-    hop_length = int(hop_length_ms * sample_rate / 1000)
+    # CRITICAL PREPROCESSING STEPS (based on Lingvo + MBT paper)
+    # Reference: https://github.com/tensorflow/lingvo/blob/master/lingvo/tasks/asr/frontend.py
     
-    # Compute mel spectrogram
+    # 1. Apply preemphasis (Lingvo default: 0.97)
+    # This high-pass filter emphasizes high frequencies
+    # Formula: signal[n] - preemph * signal[n-1]
+    preemph = 0.97
+    audio_preemph = np.append(audio[0], audio[1:] - preemph * audio[:-1])
+    
+    # 2. Convert ms to samples
+    hop_length = int(hop_length_ms * sample_rate / 1000)  # 10ms = 160 samples
+    win_length = int(win_length_ms * sample_rate / 1000)  # 25ms = 400 samples
+    
+    # 3. Compute mel spectrogram
     mel_spec = librosa.feature.melspectrogram(
-        y=audio,
+        y=audio_preemph,
         sr=sample_rate,
-        n_fft=512,
+        n_fft=512,  # Standard FFT size (Lingvo uses 512 or 1024 if fft_overdrive=True)
         hop_length=hop_length,
         win_length=win_length,
-        window='hamming',
+        window='hamming',  # PAPER EXPLICITLY STATES HAMMING WINDOW
         n_mels=n_mels,
-        fmin=0,
-        fmax=sample_rate // 2
+        fmin=125.0,  # Lingvo default: 125 Hz (not 0!) - ignores very low frequencies
+        fmax=7600.0,  # Lingvo default: 7600 Hz (not 8000!) - typical speech range
+        power=2.0  # Energy (squared magnitude)
     )
     
-    # Convert to log scale (dB)
-    log_mel_spec = librosa.power_to_db(mel_spec, ref=np.max)
+    # Keep LINEAR scale (power) - DO NOT convert to dB!
+    # The pretrained MBT model was trained on linear-scale spectrograms
+    # with mean=1.102 and std=2.762, which are linear-scale statistics.
+    # Converting to dB would create a distribution mismatch.
     
     # Transpose to (time, frequency)
-    log_mel_spec = log_mel_spec.T
+    mel_spec = mel_spec.T
     
-    return log_mel_spec
+    return mel_spec
 
 
 def create_int64_feature(value):

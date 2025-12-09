@@ -206,7 +206,7 @@ class AVTFRecordDatasetFactory(video_tfrecord_dataset.TFRecordDatasetFactory):
           decoder_builder=self.decoder_builder,
           preprocessor_builder=self.preprocessor_builder,
           postprocessor_builder=self.postprocessor_builder,
-          input_feature_name='WAVEFORM/feature/floats',  # VGGSound uses WAVEFORM instead of melspec
+          input_feature_name='WAVEFORM/feature/floats',  # VGGSound and audioset uses WAVEFORM instead of melspec
           input_shape=spec_shape,
           is_training=is_training,
           num_frames=num_spec_frames,

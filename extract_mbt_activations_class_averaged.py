@@ -20,11 +20,15 @@ Storage comparison:
 Usage:
   # Extract everything (activations, logits, and compute mAP):
   python extract_mbt_activations_class_averaged.py \
-    --config=scenic/projects/mbt/configs/audioset/audioset_classification.py \
-    --checkpoint_dir=mbt_base \
-    --test_data_dir=Datasets/audioset_eval \
-    --output_dir=audioset_analysis \
-    --audioset_labels_csv=Video_csvs/audioset_labels.csv
+    --config=scenic/projects/mbt/configs/audioset/Inference_config.py \
+    --checkpoint_dir=CheckPoints/MBT_AV \
+    --test_data_dir=Datasets/audioset_evel_configCorrect \
+    --output_dir=audioset_analysis_12-9-2025 \
+    --audioset_labels_csv=Video_csvs/audioset_labels.csv\
+    --save_logits \
+    --compute_map \
+    --batch_size=1 \
+    --num_samples=500
 
   # Extract only logits and compute mAP (no activations):
   python extract_mbt_activations_class_averaged.py \
@@ -62,7 +66,7 @@ flags.DEFINE_string('test_data_dir', None, 'Directory with test TFRecords')
 flags.DEFINE_string('output_dir', 'audioset_class_averaged', 'Output directory')
 flags.DEFINE_string('audioset_labels_csv', None, 'Path to audioset_labels.csv for class names')
 flags.DEFINE_integer('num_samples', None, 'Number of samples to process (None = all)')
-flags.DEFINE_integer('batch_size', 4, 'Batch size for processing (higher = faster but more memory)')
+flags.DEFINE_integer('batch_size', 1, 'Batch size for processing (higher = faster but more memory)')
 flags.DEFINE_bool('average_attention_heads', True, 'Average attention over heads to reduce size')
 flags.DEFINE_integer('clear_cache_every', 1, 'Clear JAX cache every N samples')
 flags.DEFINE_bool('save_attention', False, 'Save attention weights (increases storage significantly)')
@@ -475,14 +479,14 @@ class ClassAccumulator:
           act_value = np.asarray(act_value, dtype=np.float32)
           
           if os.path.exists(sum_path):
-            print("skipped")
+
             # Load existing sum, add to it, save back
             existing_sum = np.load(sum_path)
             existing_sum[:] += act_value
             np.save(sum_path, existing_sum)
           else:
             # First time seeing this class - save initial sum
-            print("skipped")
+
             np.save(sum_path, np.array(act_value, copy=True, dtype=np.float32))
     
     else:
@@ -502,13 +506,13 @@ class ClassAccumulator:
             sum_path = self._get_sum_path(class_idx, act_name)
             
             if os.path.exists(sum_path):
-              print("skipped")
+
               # Load existing sum, add to it, save back
               existing_sum = np.load(sum_path)
               existing_sum[:] += sample_activation
               np.save(sum_path, existing_sum)
             else:
-              print("skipped")
+
               # First time seeing this class - save initial sum
               np.save(sum_path, np.array(sample_activation, copy=True, dtype=np.float32))
   

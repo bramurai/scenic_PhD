@@ -118,21 +118,17 @@ python create_audioset_ready.py
 ### Step 2: Preprocess Videos
 
 ```bash
-python download_and_preprocess.py \
+
+  python download_and_preprocess.py \
   --csv_path=Video_csvs/audioset_eval.csv \
-  --output_path=Datasets/audioset_evel_configCorrect \
+  --output_path=Datasets/audioset_eval_configCorrect \
   --temp_dir=./downloaded_videos \
   --audioset_labels_csv=Video_csvs/audioset_labels.csv \
-  --clip_duration=8.0 \
-  --rgb_duration=2.56 \
   --num_shards=100 \
-  --keep_videos=True
+  --download_full_segment=True \
+  --cookies_file=cookies.txt 
 ```
 
-**Key Parameters**:
-- `--audioset_labels_csv`: Enables AudioSet multi-label mode
-- `--clip_duration=8.0`: Audio clip duration (MBT uses 8s for AudioSet)
-- `--rgb_duration=3.0`: RGB clip duration (MBT uses 3s, ~75 frames at 25fps)
 
 ### Step 3: Verify TFRecords
 

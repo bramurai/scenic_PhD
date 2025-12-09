@@ -62,6 +62,7 @@ def get_config():
   config.dataset_configs.spec_stride = 1
 
   # These statistics were calculated over the entire unbalanced train set.
+  # Model was trained on LINEAR-scale mel spectrograms (NOT dB scale)
   config.dataset_configs.spec_mean = 1.102
   config.dataset_configs.spec_stddev = 2.762
 

@@ -39,16 +39,17 @@ flags.DEFINE_integer('n_mels', 128, 'Number of mel bins.')
 flags.DEFINE_float('win_length_ms', 25.0, 'Window length in ms.')
 flags.DEFINE_float('hop_length_ms', 10.0, 'Hop length in ms.')
 flags.DEFINE_bool('skip_existing', True, 'Skip if TFRecord shard already processed.')
+flags.DEFINE_integer('batch_size', 100, 'Process this many videos before cleaning temp files.')
 flags.DEFINE_string('progress_file', None, 'File to track progress (auto-generated if not specified).')
 flags.DEFINE_integer('save_progress_every', 1, 'Save progress every N videos.')
+flags.DEFINE_bool('check_duration', False, 'Verify video duration before downloading segment.')
+flags.DEFINE_string('cookies_from_browser', None, 'Browser to extract cookies from (chrome, firefox, edge, etc).')
+flags.DEFINE_string('cookies_file', None, 'Path to cookies.txt file for yt-dlp authentication.')
 flags.DEFINE_string('local_videos_dir', None, 'If set, treat video paths as relative to this directory and use local mp4 files instead of downloading from YouTube.')
 flags.DEFINE_bool('require_local', False, 'If True and local_videos_dir is set, skip videos not found locally instead of falling back to YouTube download.')
 flags.DEFINE_bool('local_are_clips', False, 'If True, local videos are already 10s clips (extract 0-10s instead of using CSV start/end times).')
-flags.DEFINE_float('clip_duration', 8.0, 'Duration of audio clip to extract in seconds (e.g., 8.0 for MBT AudioSet, 10.0 for VGGSound).')
-flags.DEFINE_float('rgb_duration', None, 'Duration of RGB clip to extract in seconds. If not set, uses clip_duration. For MBT AudioSet_cofig: use 2.56 for RGB, 8.0 for audio.')
-flags.DEFINE_string('audioset_labels_csv', None, 'Path to audioset_labels.csv for mapping MIDs to indices (required for AudioSet data).')
-flags.DEFINE_bool('audioset_multilabel', False, 'If True, use multi-hot encoding for AudioSet labels (multiple labels per sample).')
-flags.DEFINE_bool('keep_videos', True, 'If True, keep downloaded MP4 files for reuse in future preprocessing runs.')
+flags.DEFINE_string('audioset_labels_csv', None, 'Path to audioset_labels.csv for mapping MIDs to indices (enables multi-hot label encoding for AudioSet).')
+flags.DEFINE_bool('download_full_segment', True, 'If True, download the entire CSV segment (start to end). If False, download full video.')
 
 flags.mark_flag_as_required('csv_path')
 flags.mark_flag_as_required('output_path')
@@ -73,7 +74,12 @@ def get_video_duration(video_id: str) -> Optional[float]:
             '--no-playlist',
             '--sleep-requests', '1',  # Sleep 1 second between requests to avoid rate limiting
         ]
-
+        
+        # Add cookie authentication if provided
+        if FLAGS.cookies_from_browser:
+            cmd.extend(['--cookies-from-browser', FLAGS.cookies_from_browser])
+        elif FLAGS.cookies_file:
+            cmd.extend(['--cookies', FLAGS.cookies_file])
         
         cmd.append(url)
         
@@ -165,23 +171,35 @@ def parse_audioset_labels(label_string: str, mid_to_index: dict, num_classes: in
     return multi_hot
 
 
-def download_youtube_video(video_id: str, start_time: int, output_path: str) -> bool:
-    """Download a clip from YouTube using yt-dlp.
+def download_youtube_video(video_id: str, start_time: int, end_time: int, output_path: str, 
+                          check_duration: bool = True, download_segment_only: bool = True) -> bool:
+    """Download a video or segment from YouTube using yt-dlp.
     
     Args:
         video_id: YouTube video ID.
-        start_time: Start time in seconds.
-,
-        clip_duration: Duration of clip to extract in seconds.
+        start_time: Start time in seconds from CSV.
+        end_time: End time in seconds from CSV.
+        output_path: Output file path.
+        check_duration: Whether to verify video duration before downloading.
+        download_segment_only: If True, download only the CSV segment. If False, download full video.
         
     Returns:
         True if successful, False otherwise.
     """
     try:
         url = f"https://www.youtube.com/watch?v={video_id}"
-
-        # Download full video at lowest quality (faster than you'd think for "worst")
-        # Let ffmpeg handle the segment extraction for better compatibility
+        
+        # Check if the video is long enough for the requested segment
+        if check_duration:
+            duration = get_video_duration(video_id)
+            if duration is None:
+                logging.warning(f"Could not get duration for {video_id}, attempting download anyway")
+            elif end_time > duration:
+                logging.warning(f"Video {video_id} is only {duration:.1f}s long, "
+                              f"cannot extract segment at {start_time}s-{end_time}s")
+                return False
+        
+        # Build yt-dlp command
         cmd = [
             'yt-dlp',
             '--quiet',
@@ -191,9 +209,29 @@ def download_youtube_video(video_id: str, start_time: int, output_path: str) -> 
             '--no-playlist',
             '--concurrent-fragments', '4',  # Download fragments in parallel
             '--throttled-rate', '100K',  # Skip if speed drops below 100KB/s
-            '--sleep-requests', '1',  # Sleep 1 second between requests to avoid rate limiting
+            '--sleep-requests', '1',  # Sleep 1 second between requests
         ]
-
+        
+        # Add segment download if requested (much faster and less storage)
+        if download_segment_only:
+            segment_duration = end_time - start_time
+            cmd.extend([
+                '--download-sections', f'*{start_time}-{end_time}',
+                '--force-keyframes-at-cuts',  # Ensure clean segment boundaries
+            ])
+            logging.info(f"Downloading {segment_duration}s segment ({start_time}-{end_time}s) from {video_id}")
+        else:
+            logging.info(f"Downloading full video {video_id}")
+        
+        # Add cookie authentication if provided
+        if FLAGS.cookies_from_browser:
+            cmd.extend(['--cookies-from-browser', FLAGS.cookies_from_browser])
+        elif FLAGS.cookies_file:
+            if not os.path.exists(FLAGS.cookies_file):
+                logging.error(f"Cookies file not found: {FLAGS.cookies_file}")
+                return False
+            cmd.extend(['--cookies', FLAGS.cookies_file])
+        
         cmd.append(url)
         
         result = subprocess.run(cmd, capture_output=True, timeout=300, text=True)
@@ -204,6 +242,7 @@ def download_youtube_video(video_id: str, start_time: int, output_path: str) -> 
             if file_size < 1000:  # Less than 1KB is suspicious
                 logging.warning(f"Downloaded file for {video_id} is too small ({file_size} bytes)")
                 return False
+            logging.info(f"Successfully downloaded {video_id} ({file_size / 1024**2:.1f} MB)")
             return True
         else:
             # Log detailed error for debugging
@@ -212,20 +251,31 @@ def download_youtube_video(video_id: str, start_time: int, output_path: str) -> 
             logging.warning(f"yt-dlp error: {error_msg}")
             logging.warning(f"Return code: {result.returncode}")
             
-            # Check for bot detection error - this requires user intervention
-            if "Sign in to confirm you're not a bot" in error_msg or "cookies" in error_msg.lower():
-                raise RuntimeError(
-                    "YouTube bot detection triggered! YouTube is asking for authentication.\n"
-                    "To fix this:\n"
-                    "1. Export your YouTube cookies using: https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies\n"
-                    "2. Restart the script with --cookies-from-browser=chrome (or your browser) or --cookies=/path/to/cookies.txt\n"
-                    "Progress has been saved and will resume from where it left off."
-                )
+            # Check for age-restricted videos (not critical, just skip them)
+            if "confirm your age" in error_msg.lower() or "age" in error_msg.lower() and "inappropriate" in error_msg.lower():
+                logging.warning(f"Video {video_id} is age-restricted, skipping")
+                return False
+            
+            # Check for ACTUAL bot detection error - this requires user intervention
+            # Only raise RuntimeError if it's asking to sign in AND we don't already have cookies configured
+            if "Sign in to confirm you're not a bot" in error_msg:
+                if not FLAGS.cookies_from_browser and not FLAGS.cookies_file:
+                    raise RuntimeError(
+                        "YouTube bot detection triggered! YouTube is asking for authentication.\n"
+                        "To fix this:\n"
+                        "1. Export your YouTube cookies using: https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies\n"
+                        "2. Restart the script with --cookies_file=/path/to/cookies.txt or --cookies_from_browser=chrome\n"
+                        "Progress has been saved and will resume from where it left off."
+                    )
+                else:
+                    # We have cookies but still got bot detection - this is serious
+                    logging.warning(f"Bot detection despite having cookies for {video_id}, your cookies may have expired")
+                    return False
             
             return False
             
     except subprocess.TimeoutExpired:
-        logging.warning(f"Timeout downloading {video_id} after 60 seconds")
+        logging.warning(f"Timeout downloading {video_id} after 300 seconds")
         return False
     except RuntimeError:
         # Re-raise RuntimeError for bot detection to propagate to main()
@@ -238,16 +288,14 @@ def download_youtube_video(video_id: str, start_time: int, output_path: str) -> 
 
 
 def process_video_entry(row: dict, temp_dir: str, label_to_index: Optional[dict] = None, 
-                        mid_to_index: Optional[dict] = None, clip_duration: float = 10.0, keep_videos: bool = True, **kwargs) -> Optional[object]:
-    """Download video temporarily, process it, and optionally keep it for reuse.
+                        mid_to_index: Optional[dict] = None, **kwargs) -> Optional[object]:
+    """Download video and process it (videos are always kept for reuse).
     
     Args:
         row: CSV row with video_id, start, end, label, clip_id.
-        temp_dir: Temporary directory for downloads.
+        temp_dir: Directory for downloaded videos.
         label_to_index: Dictionary mapping label strings to indices (for single-label datasets).
         mid_to_index: Dictionary mapping AudioSet MIDs to indices (for AudioSet multilabel).
-        clip_duration: Duration of clip to extract in seconds.
-        keep_videos: If True, keep downloaded videos for reuse; if False, delete after processing.
         **kwargs: Additional arguments for create_sequence_example.
         
     Returns:
@@ -258,44 +306,58 @@ def process_video_entry(row: dict, temp_dir: str, label_to_index: Optional[dict]
     video_path = row['video_path']
     video_id = video_path.rsplit('_', 1)[0]  # Split from right, keep left part
     
-    start_time = int(row['start'])
-    end_time = start_time + clip_duration  # Use clip_duration instead of CSV end time
+    csv_start_time = int(row['start'])
+    csv_end_time = int(row['end'])
     label = row.get('label')
     clip_id = row.get('clip_id')
     
-    # Create temporary file for video
+    # Create file path for video (always kept, never deleted)
     temp_video = os.path.join(temp_dir, f"{clip_id}.mp4")
-    should_delete_after = not keep_videos  # Flag for cleanup at the end
     need_to_download = True  # Assume we need to download unless we find a local copy
     
+    # Determine extraction times based on whether we downloaded a segment or full video
+    # If we download segment only, extract from beginning (0)
+    # If we download full video, extract from csv_start_time
+    extraction_start = 0  # Will be adjusted based on download mode
+    
+    # Calculate clip duration from CSV (end - start)
+    clip_duration = csv_end_time - csv_start_time
+    
     try:
-        # Check temp_downloads/ directory first (takes priority over local_videos_dir)
-        temp_downloads_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp_downloads')
-        temp_downloads_candidate = os.path.join(temp_downloads_dir, os.path.basename(video_path))
-        
-        if os.path.exists(temp_downloads_candidate):
-            logging.info(f"Found video in temp_downloads/ for {clip_id}: {temp_downloads_candidate}")
-            temp_video = temp_downloads_candidate
-            should_delete_after = False
+        # Check if video already exists in temp_dir (current download directory)
+        if os.path.exists(temp_video):
+            logging.info(f"Found video in temp_dir for {clip_id}: {temp_video}")
             need_to_download = False
+            # Downloaded segment videos should be extracted from 0
+            extraction_start = 0 if FLAGS.download_full_segment else csv_start_time
+        
+        # Check temp_downloads/ directory (takes priority over local_videos_dir)
+        elif os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp_downloads')):
+            temp_downloads_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp_downloads')
+            temp_downloads_candidate = os.path.join(temp_downloads_dir, os.path.basename(video_path))
+            
+            if os.path.exists(temp_downloads_candidate):
+                logging.info(f"Found video in temp_downloads/ for {clip_id}: {temp_downloads_candidate}")
+                temp_video = temp_downloads_candidate
+                need_to_download = False
+                # Assume temp_downloads contains full videos
+                extraction_start = csv_start_time
 
-        # If not in temp_downloads/, check local_videos_dir
-        elif FLAGS.local_videos_dir:
+        # If not in temp_dir or temp_downloads/, check local_videos_dir
+        if need_to_download and FLAGS.local_videos_dir:
             # The CSV may contain filenames like '..._000001.mp4' or full paths; use basename when joining
             candidate = os.path.join(FLAGS.local_videos_dir, os.path.basename(video_path))
             if os.path.exists(candidate):
                 logging.info(f"Using local video for {clip_id}: {candidate}")
                 temp_video = candidate
-                should_delete_after = False
                 need_to_download = False
                 
                 # If local videos are already clips, extract from 0-clip_duration instead of CSV start/end
                 if FLAGS.local_are_clips:
-                    start_time = 0
-                    end_time = clip_duration
-                    logging.info(f"Local video is pre-clipped, extracting 0-{clip_duration}s instead of {row['start']}-{row['end']}s")
-                
-
+                    extraction_start = 0
+                    logging.info(f"Local video is pre-clipped, extracting from 0s instead of {csv_start_time}s")
+                else:
+                    extraction_start = csv_start_time
             else:
                 # If require_local is set, skip this video instead of downloading
                 if FLAGS.require_local:
@@ -306,8 +368,19 @@ def process_video_entry(row: dict, temp_dir: str, label_to_index: Optional[dict]
 
         # Download video from YouTube if we don't have a local copy
         if need_to_download:
-            if not download_youtube_video(video_id, start_time, temp_video, clip_duration=clip_duration):
+            if not download_youtube_video(
+                video_id, 
+                csv_start_time, 
+                csv_end_time, 
+                temp_video, 
+                check_duration=FLAGS.check_duration,
+                download_segment_only=FLAGS.download_full_segment
+            ):
                 return None
+            
+            # If we downloaded segment only, extract from beginning (0)
+            # If we downloaded full video, extract from csv_start_time
+            extraction_start = 0 if FLAGS.download_full_segment else csv_start_time
 
         # Process label: if AudioSet multilabel mode, parse MIDs to multi-hot array
         processed_label = label
@@ -317,14 +390,15 @@ def process_video_entry(row: dict, temp_dir: str, label_to_index: Optional[dict]
             logging.info(f"Converted label '{label}' to multi-hot array with {int(processed_label.sum())} active classes")
         
         # Process video - extract the specific segment with ffmpeg
+        # extraction_start is 0 if we downloaded segment, csv_start_time if full video
+        # end_time is extraction_start + clip_duration (duration from CSV)
         sequence_example = gen_module.create_sequence_example(
             video_path=temp_video,
-            start_time=start_time,  # Extract from full video
-            end_time=end_time,      # Calculated from clip_duration
+            start_time=extraction_start,  # Start from 0 (segment) or csv_start_time (full video)
+            end_time=extraction_start + clip_duration,  # End based on CSV duration
             label=processed_label,  # Either original string or multi-hot array
             clip_id=clip_id,
             label_to_index=label_to_index if mid_to_index is None else None,  # Only use label_to_index for non-AudioSet
-            clip_duration=clip_duration,  # Pass clip_duration to override end_time
             **kwargs
         )
 
@@ -335,15 +409,9 @@ def process_video_entry(row: dict, temp_dir: str, label_to_index: Optional[dict]
         raise
     except Exception as e:
         logging.error(f"Error processing {clip_id}: {e}")
+        import traceback
+        logging.error(f"Traceback: {traceback.format_exc()}")
         return None
-
-    finally:
-        # Delete temporary file only if we created it in temp_dir and should_delete_after is True
-        try:
-            if should_delete_after and os.path.exists(temp_video) and os.path.dirname(temp_video) == os.path.abspath(temp_dir):
-                os.remove(temp_video)
-        except Exception:
-            pass
 
 
 def main(argv):
@@ -448,8 +516,8 @@ def main(argv):
                 progress_data = json.load(f)
                 processed_indices = set(progress_data.get('processed_indices', []))
                 logging.info(f"Resuming from progress file: {len(processed_indices)} already processed")
-        except:
-            logging.warning(f"Could not load progress file, starting fresh")
+        except Exception as e:
+            logging.warning(f"Could not load progress file: {e}. Starting fresh")
     
     def save_progress(processed_set):
         """Save progress to disk."""
@@ -501,9 +569,6 @@ def main(argv):
                 temp_dir,
                 label_to_index=label_to_index,
                 mid_to_index=mid_to_index,
-                clip_duration=FLAGS.clip_duration,
-                keep_videos=FLAGS.keep_videos,
-                rgb_duration=FLAGS.rgb_duration,
                 target_fps=FLAGS.target_fps,
                 decode_audio=FLAGS.decode_audio,
                 audio_sample_rate=FLAGS.audio_sample_rate,
@@ -529,9 +594,6 @@ def main(argv):
             # Save progress periodically
             if idx % FLAGS.save_progress_every == 0:
                 save_progress(processed_indices)
-            
-            # Clean temp directory periodically ONLY if we're not keeping videos
-            
     
     except RuntimeError as e:
         # Handle bot detection or other critical errors
@@ -568,23 +630,15 @@ def main(argv):
     # Save final progress
     save_progress(processed_indices)
     
-    # Cleanup temp directory only if keep_videos is False
-    if not FLAGS.keep_videos and not FLAGS.temp_dir:  # Only cleanup if we created it and keep_videos is False
-        try:
-            import shutil
-            shutil.rmtree(temp_dir)
-            logging.info(f"Cleaned up temporary directory: {temp_dir}")
-        except Exception as e:
-            logging.warning(f"Could not cleanup temp directory: {e}")
-    elif FLAGS.keep_videos:
-        logging.info(f"Keeping downloaded videos in: {temp_dir}")
+    # Videos are always kept in temp_dir
+    logging.info(f"Downloaded videos saved in: {temp_dir}")
     
     logging.info("\n=== Processing Complete ===")
     logging.info(f"Successful: {successful}")
     logging.info(f"Failed: {failed}")
     logging.info(f"Skipped (existing shards): {skipped}")
     logging.info(f"Output: {FLAGS.output_path}")
-    logging.info(f"\nStorage used: Only TFRecords (~{successful * 5}MB estimated)")
+    logging.info(f"Videos: {temp_dir}")
 
 
 if __name__ == '__main__':
