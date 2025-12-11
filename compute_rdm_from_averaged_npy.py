@@ -6,11 +6,13 @@ Also generates RDM plots and dissimilarity evolution plots using the same plotti
 Optoions: combined, recompute, plot_dendograms
 Usage:
   python compute_rdm_from_averaged_npy.py \
-    --averaged_dir=audioset_analysis_test/averaged_activations \
+    --averaged_dir=audioset_analysis_12-9-2025/averaged_activations \
     --labels_csv=Video_csvs/audioset_labels.csv \
-    --output_dir=RDM_test \
+    --output_dir=RDM_12-9-2025 \
     --distance_metric=correlation \
     --minimal_plot \
+    --recompute \
+    --combined
 """
 
 import os
