@@ -5,8 +5,8 @@ This script works with the output from extract_mbt_activations_class_averaged.py
 
 Usage:
   python compute_rdm_class_averaged.py \
-    --activation_file=audioset_analysis_AV/class_averaged_activations.npz \
-    --output_dir=RDM_class_averaged \
+    --activation_file=audioset_analysis_12-9-2025/class_averaged_activations.npz \
+    --output_dir=RDM_from_averaged_minimal \
     --distance_metric=correlation \
     --audioset_labels_csv=Video_csvs/audioset_labels.csv
 """
@@ -35,7 +35,7 @@ flags.DEFINE_list('layers', None,
                   'If None, analyzes all layers.')
 flags.DEFINE_bool('standardize', True, 
                   'Standardize activations before computing distances')
-flags.DEFINE_bool('plot_dendrograms', True, 
+flags.DEFINE_bool('plot_dendrograms', False, 
                   'Include hierarchical clustering dendrograms')
 flags.DEFINE_string('audioset_labels_csv', None,
                     'Path to audioset_labels.csv for class names')
