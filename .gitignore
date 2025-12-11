@@ -32,3 +32,4 @@ train_tfrecords_local
 scenic.egg-info/PKG-INFO
 test_tfrecords_local
 Audioset_test/data-00000-of-00001.tfrecord
+*.err

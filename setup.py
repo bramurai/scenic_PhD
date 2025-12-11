@@ -62,7 +62,6 @@ class InstallCommand(install.install):
 
 install_requires_projects = [
     "ott-jax>=0.2.0",
-    "sklearn",
     "scikit-learn==1.2.2",
     "lingvo==0.11.0",
     "seaborn>=0.11.2",
@@ -71,10 +70,13 @@ install_requires_projects = [
 
 install_requires_core = [
     "absl-py>=1.0.0,<2.0.0",
+    "lingvo==0.11.0",
+    "seaborn>=0.11.2",
+    "dmvr @ git+https://github.com/google-deepmind/dmvr.git",
     "numpy>=1.12,<2",
     "scipy>=1.8.0,<1.9.0",
     "jax==0.4.16", #"jax>=0.4.3,<0.4.24",
-    "jaxlib==0.4.16", #"jaxlib>=0.4.3,<0.4.24",
+    "jaxlib==0.4.16",#"jaxlib==0.4.3",  #+cuda11.cudnn82 -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html,"jaxlib==0.4.16", "jaxlib>=0.4.3,<0.4.24",
     "flax>=0.4.0,<0.7.0",
     "ml-collections>=0.1.1",
     "tensorflow>=2.7,<2.12",
