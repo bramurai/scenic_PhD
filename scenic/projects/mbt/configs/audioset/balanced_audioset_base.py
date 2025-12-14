@@ -76,7 +76,7 @@ def get_config():
   # The effective batch size per host when testing is
   # num_test_clips * test_batch_size
   config.dataset_configs.num_test_clips = 4
-  config.dataset_configs.test_batch_size = 1  # Needs to be num_local_devices
+  config.dataset_configs.test_batch_size = 8  # Needs to be num_local_devices
   config.multicrop_clips_per_device = 2
   # Leaving this empty means that a full test is done each time.
   # About 4200 / 4 = 1050 steps on a 4-host setting (ie 4x4 TPU)

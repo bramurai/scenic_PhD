@@ -15,12 +15,18 @@
 #SBATCH --partition=gpu                    # Partition (adjust to your cluster)
 #SBATCH --nodes=1                          # Number of nodes
 #SBATCH --ntasks=1                         # Number of tasks
-#SBATCH --cpus-per-task=8                  # CPUs per task
-#SBATCH --gres=gpu:1                       # GPUs (1 GPU, adjust as needed)
-#SBATCH --mem=64G                          # Total memory (64GB recommended)
+#SBATCH --cpus-per-task=16                 # CPUs per task (4 per GPU)
+#SBATCH --gres=gpu:4                       # 4 GPUs to handle 4-crop multicrop evaluation
+#SBATCH --mem=256G                         # Total memory (32GB per GPU)
 #SBATCH --time=24:00:00                    # Wall time (24 hours)
 #SBATCH --output=logs/mbt_extraction_%j.log     # Output log file (%j = job ID)
 #SBATCH --error=logs/mbt_extraction_%j.err      # Error log file
+
+# Multi-GPU Notes for Multicrop Evaluation:
+# - Config has num_test_clips=4 (4 crops per sample)
+# - With 4 GPUs, each GPU processes 1 crop = perfect fit!
+# - This distributes memory load across GPUs
+# - Keep BATCH_SIZE=1 (already accounts for 4 crops)
 
 set -e  # Exit on error
 
@@ -42,7 +48,7 @@ echo ""
 
 # Python environment (choose one):
 # Option 1: Conda environment
-CONDA_ENV="scenic_phd"
+
 # Option 2: Virtual environment
 # VENV_PATH="/path/to/venv"
 
@@ -62,16 +68,19 @@ TEST_DATA_DIR="${SCRIPT_DIR}/Datasets/audioset_eval_configCorrect"
 LABELS_CSV="${SCRIPT_DIR}/Video_csvs/audioset_labels.csv"
 
 # Output directory
-OUTPUT_DIR="${SCRIPT_DIR}/audioset_extraction_$(date +%Y%m%d_%H%M%S)"
+OUTPUT_DIR="${SCRIPT_DIR}/a_e$(date +%Y-%m-%d_%H%M%S)"
 
 # Processing parameters
-NUM_SAMPLES=16          # None = process all, or specify number (e.g., 500)
-BATCH_SIZE=16              # Batch size (1 = slower but safer for memory)
+NUM_SAMPLES=80     # None = process all, or specify number (e.g., 500)
+# Pass 1: Always batch_size=4 (device-parallel pmap across 4 GPUs, multicrop=4)
+# Pass 2: Configurable batch size (sequential activation extraction, NO multicrop = 4x faster!)
+PASS1_BATCH_SIZE=4       # Fixed at 4 for pmap (DO NOT CHANGE)
+PASS2_BATCH_SIZE=16    # Higher = faster Pass 2 (e.g., 2, 4, 8), but uses more GPU memory
 CHECKPOINT_EVERY=1       # Save checkpoint every N batches (0 = disable)
 CLEAR_CACHE_EVERY=1       # Clear JAX cache every N batches
 
 # Flags for what to save/compute
-SAVE_ACTIVATIONS="--save_activations"           # --save_activations or --nosave_activations
+SAVE_ACTIVATIONS="--nosave_activations"           # --save_activations or --nosave_activations
 SAVE_LOGITS="--save_logits"                     # Include or remove
 COMPUTE_MAP="--compute_map"                     # Include or remove
 SAVE_ATTENTION=""                               # --save_attention (increases storage) or empty
@@ -89,7 +98,7 @@ echo "Started at: $(date)"
 echo ""
 
 # Create logs directory if it doesn't exist
-
+mkdir -p "$SCRIPT_DIR/logs"
 
 # Print environment info
 echo "Environment Information:"
@@ -137,20 +146,10 @@ export XLA_PYTHON_CLIENT_PREALLOCATE="false"
 export XLA_PYTHON_CLIENT_MEM_FRACTION="0.75"
 echo "  Set GPU/cuDNN workaround environment variables"
 
-# Activate conda environment
-if [ -n "$CONDA_ENV" ]; then
-    echo "  Using conda environment: $CONDA_ENV"
-    source ~/.bashrc
-    conda activate "$CONDA_ENV"
-    if [ $? -ne 0 ]; then
-        echo "ERROR: Failed to activate conda environment '$CONDA_ENV'"
-        exit 1
-    fi
-# Otherwise activate venv
-elif [ -n "$VENV_PATH" ]; then
-    echo "  Using virtual environment: $VENV_PATH"
-    source "$VENV_PATH/bin/activate"
-fi
+
+module load anaconda3
+
+source activate "scenic_phd"
 
 # Verify Python
 PYTHON=$(which python3)
@@ -212,9 +211,14 @@ echo ""
 # Set Environment Variables for JAX (Optional but Recommended)
 ################################################################################
 
+# Use conda-installed cuDNN 8.9.7 (overrides system cuDNN 8.2)
+# Since 'source activate' doesn't set CONDA_PREFIX, hardcode the path
+export CONDA_ENV_PATH="$HOME/.conda/envs/scenic_phd"
+export LD_LIBRARY_PATH="${CONDA_ENV_PATH}/lib:${LD_LIBRARY_PATH}"
+
 # Limit JAX memory growth to avoid OOM
-export JAX_PLATFORMS="gpu"                    # Use GPU, or "cpu" for CPU-only
-export JAX_BACKEND_TARGET="gpu"
+export JAX_PLATFORMS="cuda"                   # Use "cuda" for NVIDIA GPUs, "cpu" for CPU-only
+export JAX_BACKEND_TARGET="cuda"
 # export JAX_DEVICES="cuda:0"                 # Specific GPU device (optional)
 
 # Optional: Set memory pre-allocation percentage (0.0-1.0)
@@ -246,7 +250,8 @@ CMD="$PYTHON $MBT_SCRIPT \
     --test_data_dir=$TEST_DATA_DIR \
     --output_dir=$OUTPUT_DIR \
     --audioset_labels_csv=$LABELS_CSV \
-    --batch_size=$BATCH_SIZE \
+    --batch_size=$PASS1_BATCH_SIZE \
+    --pass2_batch_size=$PASS2_BATCH_SIZE \
     --checkpoint_every=$CHECKPOINT_EVERY \
     --clear_cache_every=$CLEAR_CACHE_EVERY"
 

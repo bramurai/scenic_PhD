@@ -219,14 +219,28 @@ class AVTFRecordDatasetFactory(video_tfrecord_dataset.TFRecordDatasetFactory):
           dataset_stddev=dataset_spec_stddev,
           sync_random_state=True)
 
-    load_modalities.add_label(
-        parser_builder=self.parser_builder,
-        decoder_builder=self.decoder_builder,
-        preprocessor_builder=self.preprocessor_builder,
-        is_multi_label=True,
-        one_hot_label=True,  # Keep multi-hot format from TFRecords
-        num_classes=self.num_classes,
-        add_label_name=False)
+    # load_modalities.add_label(
+    #   parser_builder=self.parser_builder,
+    #   decoder_builder=self.decoder_builder,
+    #   preprocessor_builder=self.preprocessor_builder,
+    #   is_multi_label=True,
+    #   one_hot_label=True,  # Keep multi-hot format from TFRecords
+    #   num_classes=self.num_classes,
+    #   add_label_name=False)
+    # CRITICAL: Parse multi-hot labels from the correct TFRecord feature
+    # The default load_modalities.add_label() looks for 'clip/label/index' which doesn't exist
+    # Our TFRecords use 'clip/label/multi_hot' (float array) instead
+    self.parser_builder.parse_feature(
+        feature_name='clip/label/multi_hot',
+        feature_type=tf.io.VarLenFeature(dtype=tf.float32),
+        output_name='label',
+        is_context=True)
+    
+    # Convert sparse to dense
+    self.decoder_builder.add_fn(
+        fn=tf.sparse.to_dense,
+        feature_name='label',
+        fn_name='label_sparse_to_dense')
 
 
 def load_split_from_dmvr(ds_factory,
@@ -350,13 +364,18 @@ def load_split_from_dmvr(ds_factory,
   # Enable parallel data extraction and transformation
   options.threading.max_intra_op_parallelism = 1
   
-  # Disable order enforcement for better throughput (training only)
+  # CRITICAL: Enforce deterministic order for test/eval to ensure labels match data
   if is_training:
     options.deterministic = False
-  
-  # Optimize interleave cycle length and block length for better parallelism
-  options.experimental_optimization.map_and_batch_fusion = True
-  options.experimental_optimization.parallel_batch = True
+    # Optimize for throughput in training
+    options.experimental_optimization.map_and_batch_fusion = True
+    options.experimental_optimization.parallel_batch = True
+  else:
+    # Test/eval MUST be deterministic so labels align with data
+    options.deterministic = True
+    # Disable optimizations that can reorder samples
+    options.experimental_optimization.map_and_batch_fusion = False
+    options.experimental_optimization.parallel_batch = False
   
   ds = ds.with_options(options)
   

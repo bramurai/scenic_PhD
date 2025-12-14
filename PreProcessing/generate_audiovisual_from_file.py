@@ -202,15 +202,14 @@ def compute_log_mel_spectrogram(audio: np.ndarray, sample_rate: int = 16000,
         power=2.0  # Energy (squared magnitude)
     )
     
-    # Keep LINEAR scale (power) - DO NOT convert to dB!
-    # The pretrained MBT model was trained on linear-scale spectrograms
-    # with mean=1.102 and std=2.762, which are linear-scale statistics.
-    # Converting to dB would create a distribution mismatch.
+    # Convert to LOG scale as per MBT paper: "log mel spectrograms"
+    # Use librosa's power_to_db which converts power spectrogram to dB scale
+    mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
     
     # Transpose to (time, frequency)
-    mel_spec = mel_spec.T
+    mel_spec_db = mel_spec_db.T
     
-    return mel_spec
+    return mel_spec_db
 
 
 def create_int64_feature(value):

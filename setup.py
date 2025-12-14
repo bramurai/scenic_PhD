@@ -66,6 +66,7 @@ install_requires_projects = [
     "lingvo==0.11.0",
     "seaborn>=0.11.2",
     "dmvr @ git+https://github.com/google-deepmind/dmvr.git",
+    "orbax-checkpoint",
 ]
 
 install_requires_core = [
@@ -87,6 +88,7 @@ install_requires_core = [
     "seaborn>=0.11.2",
     "tensorflow-datasets>=4.0.0,<4.9.0",
     "optax==0.1.5",
+    "orbax-checkpoint==0.5.16",
 ]
 
 tests_require = [

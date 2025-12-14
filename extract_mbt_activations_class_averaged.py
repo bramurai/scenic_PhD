@@ -43,7 +43,11 @@ Usage:
 import os
 import pickle
 import time
+import functools
+import glob
+import importlib.util
 from typing import Dict, Any
+import math
 from collections import defaultdict
 from absl import app, flags, logging
 import jax
@@ -52,11 +56,122 @@ import numpy as np
 import pandas as pd
 import ml_collections
 from flax.training import checkpoints
+from flax import jax_utils
 import tensorflow as tf
+import subprocess
 
 # Scenic imports
 from scenic.projects.mbt import model as mbt_model
 from scenic.projects.mbt.datasets import audiovisual_tfrecord_dataset
+
+
+class GPUMemoryTracker:
+  """Track GPU memory usage across batches."""
+  
+  def __init__(self):
+    self.batch_memory_used = []  # Memory used per batch
+    self.peak_memory = 0
+    self.num_gpus = self._get_num_gpus()
+    self.oom_batch_size = None  # Track which batch size caused OOM
+    self.num_oom_errors = 0  # Count OOM errors
+  
+  def _get_num_gpus(self):
+    """Get number of available GPUs."""
+    try:
+      result = subprocess.run(
+          ['nvidia-smi', '--list-gpus'],
+          capture_output=True,
+          text=True,
+          check=True
+      )
+      return len(result.stdout.strip().split('\n'))
+    except:
+      return 0
+  
+  def get_memory_used_mb(self):
+    """Get current GPU memory usage in MB."""
+    try:
+      result = subprocess.run(
+          ['nvidia-smi', '--query-gpu=memory.used', '--format=csv,nounits,noheader'],
+          capture_output=True,
+          text=True,
+          check=True
+      )
+      values = [int(x.strip()) for x in result.stdout.strip().split('\n')]
+      return sum(values)  # Total across all GPUs
+    except:
+      return 0
+  
+  def get_memory_total_mb(self):
+    """Get total GPU memory in MB."""
+    try:
+      result = subprocess.run(
+          ['nvidia-smi', '--query-gpu=memory.total', '--format=csv,nounits,noheader'],
+          capture_output=True,
+          text=True,
+          check=True
+      )
+      values = [int(x.strip()) for x in result.stdout.strip().split('\n')]
+      return sum(values)  # Total across all GPUs
+    except:
+      return 0
+  
+  def log_batch_memory(self, batch_num, num_samples):
+    """Log memory usage for a batch."""
+    mem_used = self.get_memory_used_mb()
+    if mem_used > self.peak_memory:
+      self.peak_memory = mem_used
+    self.batch_memory_used.append(mem_used)
+    
+    mem_per_sample = mem_used / num_samples if num_samples > 0 else 0
+    return mem_used, mem_per_sample
+  
+  def get_stats(self):
+    """Get memory statistics."""
+    if not self.batch_memory_used:
+      return {}
+    
+    return {
+        'peak_memory_mb': self.peak_memory,
+        'avg_memory_mb': np.mean(self.batch_memory_used),
+        'min_memory_mb': min(self.batch_memory_used),
+        'max_memory_mb': max(self.batch_memory_used),
+        'total_gpu_memory_mb': self.get_memory_total_mb(),
+        'num_gpus': self.num_gpus,
+    }
+  
+  def record_oom_error(self, batch_size):
+    """Record that an OOM error occurred at this batch size."""
+    self.num_oom_errors += 1
+    if self.oom_batch_size is None:
+      self.oom_batch_size = batch_size
+      logging.warning(f'OOM error recorded at batch size {batch_size}')
+  
+  def estimate_max_batch_size(self, memory_per_sample_mb, current_batch_size, safety_margin=0.15):
+    """Estimate maximum batch size based on current usage and OOM history."""
+    total_memory = self.get_memory_total_mb()
+    
+    # If we had OOM errors at a certain batch size, be conservative
+    if self.oom_batch_size is not None:
+      # Recommend reducing batch size if OOM occurred
+      recommended = max(1, self.oom_batch_size // 2)
+      return recommended, f"OOM occurred at batch size {self.oom_batch_size}, reducing recommendation to {recommended}"
+    
+    # Normal estimation based on memory per sample
+    available = total_memory * (1 - safety_margin)
+    used_per_crop = memory_per_sample_mb
+    
+    # Account for 4 crops per sample (from num_test_clips)
+    max_batch_size = int(available / (used_per_crop * 4))
+    
+    # Never recommend increasing beyond current if we're already using significant memory
+    memory_usage_pct = (self.peak_memory / total_memory) * 100 if total_memory > 0 else 0
+    if memory_usage_pct > 50:
+      # High memory usage - be conservative
+      return max(1, current_batch_size), f"Memory usage is {memory_usage_pct:.1f}%, keeping batch size at current level"
+    
+    return max(1, max_batch_size), None
+
 
 FLAGS = flags.FLAGS
 
@@ -66,7 +181,10 @@ flags.DEFINE_string('test_data_dir', None, 'Directory with test TFRecords')
 flags.DEFINE_string('output_dir', 'audioset_class_averaged', 'Output directory')
 flags.DEFINE_string('audioset_labels_csv', None, 'Path to audioset_labels.csv for class names')
 flags.DEFINE_integer('num_samples', None, 'Number of samples to process (None = all)')
-flags.DEFINE_integer('batch_size', 1, 'Batch size for processing (higher = faster but more memory)')
+flags.DEFINE_integer('batch_size', 4, 'Batch size for Pass 1 (device-parallel logits, should equal num_devices=4)')
+flags.DEFINE_integer('pass2_batch_size', 2, 'Batch size for Pass 2 (activation extraction, higher = faster)')
+flags.DEFINE_bool('device_parallel_logits', True, 'Run logits/mAP pass with pmap across devices (trainer parity)')
+flags.DEFINE_bool('two_pass', True, 'Two-pass: first logits-only with pmap, then sequential activations to avoid OOM')
 flags.DEFINE_bool('average_attention_heads', True, 'Average attention over heads to reduce size')
 flags.DEFINE_integer('clear_cache_every', 1, 'Clear JAX cache every N samples')
 flags.DEFINE_bool('save_attention', False, 'Save attention weights (increases storage significantly)')
@@ -84,7 +202,6 @@ flags.mark_flag_as_required('audioset_labels_csv')
 
 def load_config(config_path: str) -> ml_collections.ConfigDict:
   """Load config from Python file."""
-  import importlib.util
   spec = importlib.util.spec_from_file_location("config", config_path)
   config_module = importlib.util.module_from_spec(spec)
   spec.loader.exec_module(config_module)
@@ -98,14 +215,15 @@ def load_config(config_path: str) -> ml_collections.ConfigDict:
   return config
 
 
-def read_labels_from_tfrecord(tfrecord_path: str) -> list:
+def read_labels_from_tfrecord(tfrecord_path: str, return_ids: bool = False) -> list:
   """Read ALL multi-hot labels from a TFRecord file.
   
   Args:
     tfrecord_path: Path to TFRecord file
+    return_ids: If True, also return video IDs for debugging
     
   Returns:
-    List of multi-hot label vectors, one per sample in the file
+    List of multi-hot label vectors (or tuples of (label, video_id) if return_ids=True)
   """
   labels = []
   
@@ -117,19 +235,34 @@ def read_labels_from_tfrecord(tfrecord_path: str) -> list:
     # Read multi-hot label from context
     if 'clip/label/multi_hot' in example.context.feature:
       label_floats = example.context.feature['clip/label/multi_hot'].float_list.value
-      labels.append(np.array(label_floats, dtype=np.float32))
+      label_array = np.array(label_floats, dtype=np.float32)
+      
+      if return_ids:
+        # Try to get video ID for debugging
+        video_id = ''
+        if 'clip/label/text' in example.context.feature:
+          video_id = example.context.feature['clip/label/text'].bytes_list.value[0].decode('utf-8')
+        elif 'example/id' in example.context.feature:
+          video_id = example.context.feature['example/id'].bytes_list.value[0].decode('utf-8')
+        labels.append((label_array, video_id))
+      else:
+        labels.append(label_array)
     else:
       raise ValueError(f'No clip/label/multi_hot found in {tfrecord_path}')
   
   return labels
 
 
-def create_test_dataset(config: ml_collections.ConfigDict):
-  """Create test dataset iterator with labels read separately."""
+def create_test_dataset(config: ml_collections.ConfigDict, batch_size: int = None, num_test_clips: int = None):
+  """Create test dataset iterator with labels read separately.
+  
+  Args:
+    config: Configuration dict
+    batch_size: Override batch size (defaults to FLAGS.batch_size)
+    num_test_clips: Override num_test_clips (defaults to config value)
+  """
   logging.info('Creating test dataset...')
   
-  import glob
-  import functools
   tfrecord_pattern = os.path.join(FLAGS.test_data_dir, '**', '*.tfrecord')
   tfrecord_files = glob.glob(tfrecord_pattern, recursive=True)
   
@@ -146,6 +279,10 @@ def create_test_dataset(config: ml_collections.ConfigDict):
   # Determine number of samples
   num_samples = FLAGS.num_samples if FLAGS.num_samples else 100000  # Large number if None
   
+  # Use provided or default values
+  actual_batch_size = batch_size if batch_size is not None else FLAGS.batch_size
+  actual_num_test_clips = num_test_clips if num_test_clips is not None else config.dataset_configs.get('num_test_clips', 1)
+  
   # Create dataset WITHOUT labels (we'll read them separately)
   ds_factory = functools.partial(
       audiovisual_tfrecord_dataset.AVTFRecordDatasetFactory,
@@ -159,14 +296,14 @@ def create_test_dataset(config: ml_collections.ConfigDict):
   
   dataset, num_examples = audiovisual_tfrecord_dataset.load_split_from_dmvr(
       ds_factory=ds_factory,
-      batch_size=FLAGS.batch_size,  # Use configurable batch size
+      batch_size=actual_batch_size,
       subset='test',
       modalities=('spectrogram', 'rgb'),
       num_frames=config.dataset_configs.num_frames,
       stride=config.dataset_configs.stride,
       num_spec_frames=config.dataset_configs.num_spec_frames,
       spec_stride=config.dataset_configs.spec_stride,
-      num_test_clips=config.dataset_configs.get('num_test_clips', 1),
+      num_test_clips=actual_num_test_clips,
       min_resize=config.dataset_configs.min_resize,
       crop_size=config.dataset_configs.crop_size,
       spec_shape=config.dataset_configs.spec_shape,
@@ -195,6 +332,19 @@ def create_test_dataset(config: ml_collections.ConfigDict):
   
   # Return both dataset iterator and tfrecord file paths for label reading
   return dataset_iter, num_examples, tfrecord_files
+
+
+def resolve_modality_keys(batch: Dict[str, Any]):
+  """Resolve modality keys present in the batch for rgb and spectrogram.
+
+  Returns a dict mapping canonical names to actual keys in the batch.
+  """
+  keys = set(batch.keys())
+  rgb_candidates = ['rgb', 'image']
+  spec_candidates = ['spectrogram', 'spec', 'mel', 'audio']
+  rgb_key = next((k for k in rgb_candidates if k in keys), None)
+  spec_key = next((k for k in spec_candidates if k in keys), None)
+  return {'rgb': rgb_key, 'spectrogram': spec_key}
 
 
 def load_checkpoint(config: ml_collections.ConfigDict, checkpoint_dir: str):
@@ -243,6 +393,25 @@ def load_checkpoint(config: ml_collections.ConfigDict, checkpoint_dir: str):
   return model_instance, params, model_state, rng
 
 
+def pmapped_test_step_factory(flax_model, num_classes: int):
+  """Create a pmapped test step that mirrors trainer semantics (logits-only).
+
+  Each device receives `clips_per_device` crops for a single example per step,
+  sums logits over those crops, and we iterate chunks until all crops are
+  covered; finally average over total crops per example. Intermediates are NOT
+  captured to keep memory safe.
+  """
+
+  def per_device_step(variables, inputs_chunk):
+    # inputs_chunk shapes: {'rgb': [clips_per_device, ...], 'spectrogram': [...]} per device
+    # When mutable=False, apply() returns just the output (not a tuple)
+    output = flax_model.apply(variables, inputs_chunk, train=False, mutable=False)
+    # Sum logits across the `clips_per_device` axis
+    return jnp.sum(output, axis=0)
+
+  return jax.pmap(per_device_step, axis_name='devices')
+
+
 def extract_with_intermediates(model_instance, params, model_state, inputs):
   """Extract activations using intermediate capture."""
   variables = {'params': params}
@@ -283,6 +452,123 @@ def extract_with_intermediates(model_instance, params, model_state, inputs):
   }
 
 
+def process_sample_with_multicrop(params, model_state, inputs, flax_model, num_test_clips, n_clips=2):
+  """Process a sample with multiple crops - matches trainer.py test_step pattern.
+  
+  This is a simplified version that follows the original test_step exactly,
+  but also captures intermediate activations for MLP neuron extraction.
+  
+  Args:
+    params: Model parameters
+    model_state: Model state (batch_stats)
+    inputs: Dict with modality inputs - shape [num_crops, ...]
+    flax_model: Flax model instance
+    num_test_clips: Total number of crops (e.g., 4)
+    n_clips: Number of crops to process at once (e.g., 2)
+  
+  Returns:
+    Dict with 'logits' and 'activations' averaged across all crops
+  """
+  variables = {'params': params}
+  if model_state:
+    variables['batch_stats'] = model_state
+  
+  # Initialize accumulator for logits
+  all_logits = jnp.zeros(527)  # AudioSet has 527 classes
+  all_activations = {}
+  
+  # Filter function: ONLY capture MLP outputs, NOT attention matrices (which are huge!)
+  def capture_mlp_only(module, method_name):
+    """Only capture MLP block outputs, skip attention to save massive memory."""
+    # Handle modules with no name
+    if module.name is None:
+      return False
+    
+    # Skip attention completely - these create 903MB matrices!
+    if 'MultiHeadDotProductAttention' in module.name or 'Attention' in module.name:
+      return False
+    
+    # Capture MLP block outputs (these contain the neuron activations we need)
+    if 'MlpBlock' in module.name:
+      return True
+    
+    # Skip everything else (embeddings, LayerNorm, Dropout, query/key/value, etc.)
+    return False
+  
+  # Process crops in chunks - exact pattern from trainer.py test_step
+  for idx in range(0, num_test_clips, n_clips):
+    # Extract chunk of crops for this iteration
+    current_input = {}
+    for modality in inputs:
+      current_input[modality] = inputs[modality][idx:idx + n_clips]
+    
+    # Forward pass with filtered intermediate capture - ONLY MLP, not attention
+    output, state = flax_model.apply(
+        variables, current_input, train=False,
+        mutable=['intermediates'], capture_intermediates=capture_mlp_only
+    )
+    
+    # Accumulate logits (sum, then we'll average at end)
+    logits_sum = jnp.sum(output, axis=0)
+    all_logits = all_logits + logits_sum
+    
+    # Extract and accumulate activations from intermediates
+    # MOVE TO CPU IMMEDIATELY to free GPU memory
+    if 'intermediates' in state:
+      
+      def extract_from_dict(d, prefix=''):
+        """Recursively extract arrays from nested FrozenDicts and move to CPU."""
+        if hasattr(d, 'items'):
+          for key, value in d.items():
+            new_prefix = f'{prefix}/{key}' if prefix else key
+            
+            if isinstance(value, dict) or hasattr(value, 'items'):
+              extract_from_dict(value, new_prefix)
+            # Handle tuples (Flax stores method outputs as tuples)
+            elif isinstance(value, tuple):
+              # If tuple contains a single array, extract it
+              if len(value) == 1 and isinstance(value[0], (jnp.ndarray, np.ndarray)):
+                array = value[0]
+                chunk_sum = jnp.sum(array, axis=0)
+                chunk_sum_cpu = np.array(chunk_sum)  # Copy to CPU/numpy
+                if new_prefix in all_activations:
+                  all_activations[new_prefix] = all_activations[new_prefix] + chunk_sum_cpu
+                else:
+                  all_activations[new_prefix] = chunk_sum_cpu
+              # If multiple elements, try each
+              else:
+                for i, elem in enumerate(value):
+                  if isinstance(elem, (jnp.ndarray, np.ndarray)):
+                    elem_prefix = f'{new_prefix}_{i}'
+                    chunk_sum = jnp.sum(elem, axis=0)
+                    chunk_sum_cpu = np.array(chunk_sum)
+                    if elem_prefix in all_activations:
+                      all_activations[elem_prefix] = all_activations[elem_prefix] + chunk_sum_cpu
+                    else:
+                      all_activations[elem_prefix] = chunk_sum_cpu
+            elif isinstance(value, (jnp.ndarray, np.ndarray)):
+              # Sum across crops in this chunk AND move to CPU immediately
+              chunk_sum = jnp.sum(value, axis=0)
+              chunk_sum_cpu = np.array(chunk_sum)  # Copy to CPU/numpy
+              if new_prefix in all_activations:
+                all_activations[new_prefix] = all_activations[new_prefix] + chunk_sum_cpu
+              else:
+                all_activations[new_prefix] = chunk_sum_cpu
+      
+      extract_from_dict(state['intermediates'])
+      # Delete GPU state immediately after extracting
+      del state
+  
+  # Average logits and activations across all crops
+  averaged_logits = all_logits / num_test_clips
+  averaged_activations = {k: v / num_test_clips for k, v in all_activations.items()}
+  
+  return {
+      'logits': averaged_logits,
+      'activations': averaged_activations
+  }
+
+
 # JIT-compile the forward pass for speed
 @jax.jit
 def forward_pass_jit(params, model_state, inputs):
@@ -309,7 +595,7 @@ def filter_essential_activations(activations: Dict) -> Dict:
   # Extract encoder block outputs (conditional on save_activations flag)
   if FLAGS.save_activations:
     for key, value in activations.items():
-      if 'encoderblock_' in key and 'MlpBlock_0/__call__/0' in key and 'Transformer' in key:
+      if 'encoderblock_' in key and 'MlpBlock_0/__call__' in key and 'Transformer' in key:
         parts = key.split('/')
         for part in parts:
           if part.startswith('encoderblock_'):
@@ -390,17 +676,9 @@ def save_checkpoint(accumulator, processed_count, output_dir, checkpoint_name='c
   # Immediately delete temporary copy to free memory
   del checkpoint_data
   
-  # Sync to disk and drop OS caches
+  # Sync to disk
   os.sync()
-  try:
-    # Drop OS page cache, dentries, inodes
-    with open('/proc/sys/vm/drop_caches', 'w') as f:
-      f.write('3')  # 3 = drop everything (pagecache, dentries, inodes)
-    logging.info(f'  Saved checkpoint to {checkpoint_path} and dropped OS caches')
-  except PermissionError:
-    logging.info(f'  Saved checkpoint to {checkpoint_path} (no permission to drop OS caches)')
-  except Exception as e:
-    logging.info(f'  Saved checkpoint to {checkpoint_path} (could not drop OS caches: {e})')
+  logging.info(f'  Saved checkpoint to {checkpoint_path}')
 
 
 def load_checkpoint_if_exists(output_dir, num_classes, checkpoint_name='checkpoint.pkl'):
@@ -622,14 +900,14 @@ class LogitsAccumulator:
     logits_array = np.array(self.all_logits, dtype=np.float32)
     labels_array = np.array(self.all_labels, dtype=np.float32)
     
-    # Apply sigmoid to logits to get probabilities
-    probs = 1.0 / (1.0 + np.exp(-logits_array))
+    # Use raw logits directly (matching original evaluation_lib.compute_mean_average_precision)
+    # sklearn's average_precision_score handles raw scores - sigmoid not needed
     
     # Compute per-class AP - store with class indices
     aps_per_class = {}  # Maps class_idx -> AP score
     for class_idx in range(self.num_classes):
       y_true = labels_array[:, class_idx]
-      y_score = probs[:, class_idx]
+      y_score = logits_array[:, class_idx]  # Use raw logits
       
       # Only compute AP if there are positive samples
       if y_true.sum() > 0:
@@ -687,34 +965,7 @@ def main(argv):
   logging.info('MBT Class-Averaged Activation Extraction')
   logging.info('='*80)
   
-  # Clear memory caches on startup
-  logging.info('Clearing memory caches on startup...')
-  import gc
-  import subprocess
-  gc.collect()
-  gc.collect()
-  try:
-    import ctypes
-    libc = ctypes.CDLL("libc.so.6")
-    libc.malloc_trim(0)
-    logging.info('Python memory cache cleared successfully')
-  except Exception as e:
-    logging.warning(f'Could not clear Python memory cache: {e}')
-  
-  # Clear OS-level caches (pagecache, dentries, inodes)
-  logging.info('Clearing OS-level caches...')
-  try:
-    os.sync()
-    subprocess.run(['sync'], check=True)
-    # Try with sudo
-    result = subprocess.run(['sudo', 'tee', '/proc/sys/vm/drop_caches'], 
-                          input=b'3', capture_output=True)
-    if result.returncode == 0:
-      logging.info('OS caches cleared successfully')
-    else:
-      logging.warning('Could not clear OS caches (no sudo access)')
-  except Exception as e:
-    logging.warning(f'Could not clear OS caches: {e}')
+  # Memory management handled by HPC system
   
   os.makedirs(FLAGS.output_dir, exist_ok=True)
   
@@ -733,6 +984,23 @@ def main(argv):
   # Load checkpoint
   logging.info('\n[3/5] Loading checkpoint...')
   model_instance, params, model_state, rng = load_checkpoint(config, FLAGS.checkpoint_dir)
+  
+  # Determine device count and evaluation strategy
+  num_devices = jax.local_device_count()
+  logging.info(f"\nDevices detected: {num_devices}")
+  
+  # Pass 1: Always use batch_size=4 for device-parallel pmap (4 GPUs)
+  pass1_batch_size = 4
+  pass1_num_test_clips = config.dataset_configs.get('num_test_clips', 4)
+  
+  # Pass 2: Use configurable batch size, NO multicrop (single crop for speed)
+  pass2_batch_size = FLAGS.pass2_batch_size
+  pass2_num_test_clips = 1  # No multicrop in Pass 2 = 4x faster!
+  
+  logging.info(f'Pass 1 config: batch_size={pass1_batch_size}, num_crops={pass1_num_test_clips} (device-parallel with pmap)')
+  logging.info(f'Pass 2 config: batch_size={pass2_batch_size}, num_crops={pass2_num_test_clips} (sequential, no multicrop)')
+  
+  multicrop_clips_per_device = config.dataset_configs.get('multicrop_clips_per_device', 2)
   
   # Create dataset
   logging.info('\n[4/5] Loading test data...')
@@ -768,8 +1036,12 @@ def main(argv):
   logging.info(f'\n[5/5] Processing {num_to_process} samples and accumulating by class...')
   logging.info(f'Using batch size: {FLAGS.batch_size}')
   
-  # Initialize accumulator with disk storage
+  # Initialize accumulators
   accumulator = ClassAccumulator(num_classes, FLAGS.output_dir)
+  
+  # Initialize GPU memory tracker
+  gpu_tracker = GPUMemoryTracker()
+  logging.info(f'GPU Memory Tracking initialized ({gpu_tracker.num_gpus} GPUs, {gpu_tracker.get_memory_total_mb():.0f} MB total)')
   
   # Initialize logits accumulator if needed
   logits_accumulator = None
@@ -806,198 +1078,261 @@ def main(argv):
   batch_count = processed_count // FLAGS.batch_size
   start_time = time.time()
   
-  # Check for potential OOM with multicrop evaluation
-  effective_batch_size = FLAGS.batch_size * config.dataset_configs.get('num_test_clips', 1)
-  if effective_batch_size > 4:
-    logging.warning('\n' + '='*80)
-    logging.warning('WARNING: Large effective batch size detected!')
-    logging.warning(f'  batch_size={FLAGS.batch_size} × num_test_clips={config.dataset_configs.get("num_test_clips", 1)} = {effective_batch_size} samples processed together')
-    logging.warning('  This may cause Out-of-Memory errors during attention computation.')
-    logging.warning('  If you encounter OOM errors, reduce --batch_size to 1')
-    logging.warning('='*80 + '\n')
-  
+  # Pass 1: Device-parallel logits/mAP (batch_size=4, multicrop=4)
+  if FLAGS.two_pass:
+    logging.info('\n[Pass 1] Device-parallel logits/mAP evaluation (no activations)')
+    
+    # Create Pass 1 dataset with batch_size=4 and multicrop=4
+    dataset_pass1, _, _ = create_test_dataset(config, batch_size=pass1_batch_size, num_test_clips=pass1_num_test_clips)
+    # Replicate variables
+    variables = {'params': params}
+    if model_state:
+      variables['batch_stats'] = model_state
+    replicated_vars = jax_utils.replicate(variables)
+
+    per_device_step = pmapped_test_step_factory(model_instance.flax_model, num_classes)
+
+    # Iterate dataset once for logits
+    examples_seen = 0
+    for b_idx, batch in enumerate(dataset_pass1):
+      if examples_seen >= num_to_process:
+        break
+      inputs_dict = batch.get('inputs', batch)
+      key_map = resolve_modality_keys(inputs_dict)
+      if key_map['rgb'] is None or key_map['spectrogram'] is None:
+        logging.error(f"Batch modalities missing; keys available: {list(inputs_dict.keys())}. Expected one of rgb/image and spectrogram/spec.")
+        raise KeyError('Required modalities not found in batch')
+      # Expect batch_size == num_devices, one example per device
+      # batch['rgb']: [batch_size, num_test_clips, ...]
+      # We process crops in chunks of `multicrop_clips_per_device` per step
+      clips_per_device = multicrop_clips_per_device
+      total_chunks = math.ceil(pass1_num_test_clips / clips_per_device)
+      logits_sum_per_example = np.zeros((pass1_batch_size, num_classes), dtype=np.float32)
+
+      for chunk_idx in range(total_chunks):
+        start = chunk_idx * clips_per_device
+        end = min(start + clips_per_device, pass1_num_test_clips)
+        # Slice per device chunk: [devices, clips_per_device, ...]
+        inputs_chunk = {}
+        # Use resolved keys; normalize shapes if crops are flattened
+        def ensure_batch_clip_shape(x):
+          if x.shape[0] == pass1_batch_size and x.ndim >= 2 and x.shape[1] == pass1_num_test_clips:
+            return x
+          if x.shape[0] == pass1_batch_size * pass1_num_test_clips:
+            new_shape = (pass1_batch_size, pass1_num_test_clips) + x.shape[1:]
+            return x.reshape(new_shape)
+          raise ValueError(f"Unexpected input shape {x.shape}; cannot infer [batch, num_test_clips, ...] layout")
+
+        x_rgb_full = inputs_dict[key_map['rgb']]
+        x_spec_full = inputs_dict[key_map['spectrogram']]
+        x_rgb_bc = ensure_batch_clip_shape(x_rgb_full)
+        x_spec_bc = ensure_batch_clip_shape(x_spec_full)
+        inputs_chunk['rgb'] = x_rgb_bc[:, start:end]
+        inputs_chunk['spectrogram'] = x_spec_bc[:, start:end]
+
+        # Run pmapped step: returns [devices, num_classes]
+        logits_sum_devices = per_device_step(replicated_vars, inputs_chunk)
+        logits_sum_devices_np = np.array(logits_sum_devices)
+        logits_sum_per_example += logits_sum_devices_np
+
+      averaged_logits_examples = logits_sum_per_example / float(pass1_num_test_clips)
+
+      # Labels: Use dataset labels (now correctly loaded from clip/label/multi_hot)
+      # Dataset labels are guaranteed to match the data since they come from the same pipeline
+      dataset_labels = batch.get('label', batch.get('inputs', {}).get('label', None))
+      
+      if dataset_labels is not None and dataset_labels.sum() > 0:
+        # Use dataset labels (correct approach)
+        labels_np = np.array(dataset_labels)
+      else:
+        # Fallback: Read from TFRecords sequentially (may be misaligned, but better than nothing)
+        batch_labels_list = []
+        for i in range(pass1_batch_size):
+          try:
+            label = next(label_iterator)
+            batch_labels_list.append(label)
+          except StopIteration:
+            logging.warning(f'Label iterator exhausted at example {examples_seen}')
+            break
+        labels_np = np.array(batch_labels_list) if batch_labels_list else None
+      
+      if labels_np is not None:
+        # DEBUG: Log first batch to verify label alignment
+        if b_idx == 0:
+          logging.info(f'\n[Pass 1 DEBUG] First batch label verification:')
+          logging.info(f'  Batch index: {b_idx}')
+          logging.info(f'  Sample indices: {examples_seen} to {examples_seen + len(labels_np) - 1}')
+          
+          # CRITICAL CHECK: Show EVERYTHING in the batch to diagnose missing labels
+          logging.info(f'\n  === RAW BATCH INSPECTION ===')
+          logging.info(f'  Batch ALL keys: {list(batch.keys())}')
+          for key in batch.keys():
+            val = batch[key]
+            if hasattr(val, 'shape'):
+              logging.info(f'    {key}: shape={val.shape}, dtype={val.dtype}')
+            elif isinstance(val, dict):
+              logging.info(f'    {key}: dict with keys={list(val.keys())}')
+              for subkey in val.keys():
+                subval = val[subkey]
+                if hasattr(subval, 'shape'):
+                  logging.info(f'      {key}[{subkey}]: shape={subval.shape}, dtype={subval.dtype}')
+            else:
+              logging.info(f'    {key}: type={type(val).__name__}')
+          
+          # Check for dataset labels (for debugging/verification only)
+          if dataset_labels is not None:
+            logging.info(f'\n  ⚠️  Dataset contains labels with shape {dataset_labels.shape}')
+            logging.info(f'  Dataset label dtype: {dataset_labels.dtype}')
+            logging.info(f'  Dataset label stats: min={dataset_labels.min()}, max={dataset_labels.max()}, mean={dataset_labels.mean()}')
+            logging.info(f'  Dataset label sum (total): {dataset_labels.sum()}')
+            logging.info(f'  ✅ Using dataset labels for all batches (guaranteed to match data)')
+          else:
+            logging.info(f'\n  ℹ️  Dataset does NOT contain labels (falling back to TFRecord streaming)')
+              
+          for i, label in enumerate(labels_np):
+            active_classes = np.where(label > 0)[0]
+            class_names = [index_to_name.get(c, f'Unknown_{c}') for c in active_classes[:3]]
+            logging.info(f'  Sample {examples_seen + i}: {len(active_classes)} classes - {class_names}')
+            # Also log top 3 logit predictions for comparison
+            top_logit_indices = np.argsort(averaged_logits_examples[i])[-3:][::-1]
+            top_logit_classes = [index_to_name.get(c, f'Unknown_{c}') for c in top_logit_indices]
+            top_logit_scores = averaged_logits_examples[i][top_logit_indices]
+            logging.info(f'  Sample {examples_seen + i}: Top 3 predictions - {list(zip(top_logit_classes, top_logit_scores))}')
+            
+            # Check if ANY prediction is in ground truth
+            overlap = set(top_logit_indices[:10]) & set(active_classes)
+            logging.info(f'  Sample {examples_seen + i}: Top-10 overlap with GT = {len(overlap)}/{len(active_classes)} classes')
+        
+        if logits_accumulator is not None:
+          logits_accumulator.add_sample(averaged_logits_examples, labels_np)
+
+      examples_seen += pass1_batch_size
+      logging.info(f'[Pass 1] Processed {examples_seen}/{num_to_process} examples')
+
+    logging.info('[Pass 1] Device-parallel logits evaluation complete')
+    
+    # Report Pass 1 mAP
+    if FLAGS.compute_map and logits_accumulator is not None:
+      try:
+        map_score, aps_per_class = logits_accumulator.compute_map()
+        logging.info(f'[Pass 1] mAP: {map_score:.4f}')
+        logging.info(f'[Pass 1] Classes with predictions: {len(aps_per_class)}/{num_classes}')
+      except Exception as e:
+        logging.warning(f'[Pass 1] Failed to compute mAP: {e}')
+
+    # Recreate dataset iterator for pass 2 with batch_size=1 to avoid OOM
+    logging.info(f'\n[Pass 2] Sequential activation extraction (batch_size={pass2_batch_size}, no multicrop for speed)')
+    
+    # CRITICAL: Reset label iterator for Pass 2 (Pass 1 already consumed it)
+    label_iterator = create_label_iterator(tfrecord_files)
+    logging.info('  Reset label iterator for Pass 2 (starting from beginning)')
+    
+    # Create Pass 2 dataset with configurable batch size and NO multicrop (num_test_clips=1)
+    dataset, _, _ = create_test_dataset(config, batch_size=pass2_batch_size, num_test_clips=pass2_num_test_clips)
+
+  # Pass 2: Sequential activation extraction with configurable batch size
   for batch_idx, batch in enumerate(dataset):
     if processed_count >= num_to_process:
       break
     
     batch_start_time = time.time()
     
-    # Get number of crops in batch (batch_size * num_test_clips)
-    num_test_clips = config.dataset_configs.get('num_test_clips', 1)
-    current_batch_size_crops = batch['inputs']['rgb'].shape[0] if 'rgb' in batch['inputs'] else batch['inputs']['spectrogram'].shape[0]
-    current_batch_size_samples = current_batch_size_crops // num_test_clips
+    # Resolve modality keys for sequential processing as well
+    inputs_dict_seq = batch.get('inputs', batch)
+    key_map_seq = resolve_modality_keys(inputs_dict_seq)
+    if key_map_seq['rgb'] is None or key_map_seq['spectrogram'] is None:
+      logging.error(f"Batch modalities missing; keys available: {list(inputs_dict_seq.keys())}. Expected one of rgb/image and spectrogram/spec.")
+      raise KeyError('Required modalities not found in batch')
+
+    # Get batch size from actual data (Pass 2: batch_size * 1 crop)
+    actual_batch_size = inputs_dict_seq[key_map_seq['rgb']].shape[0] // pass2_num_test_clips
     
-    # Calculate which sample indices this batch contains (in terms of actual samples, not crops)
-    batch_start_idx = batch_idx * FLAGS.batch_size
-    batch_end_idx = batch_start_idx + current_batch_size_samples
+    # Get labels from dataset (guaranteed to match data)
+    batch_labels = batch.get('label', batch.get('inputs', {}).get('label', None))
     
-    # Skip if we've already processed this batch (resuming from checkpoint)
-    if batch_end_idx <= processed_count:
-      continue
-    
-    # Partial skip: some samples in this batch were already processed
-    if batch_start_idx < processed_count < batch_end_idx:
-      skip_samples = processed_count - batch_start_idx
-      skip_crops = skip_samples * num_test_clips
-      for key in batch['inputs']:
-        batch['inputs'][key] = batch['inputs'][key][skip_crops:]
-      current_batch_size_crops -= skip_crops
-      current_batch_size_samples -= skip_samples
-      batch_start_idx = processed_count
-    
-    if processed_count + current_batch_size_samples > num_to_process:
-      # Trim the last batch if it exceeds num_to_process
-      samples_to_take = num_to_process - processed_count
-      crops_to_take = samples_to_take * num_test_clips
-      for key in batch['inputs']:
-        batch['inputs'][key] = batch['inputs'][key][:crops_to_take]
-      current_batch_size_crops = crops_to_take
-      current_batch_size_samples = samples_to_take
-    
-    # Log progress for every batch with timing
+    # Log progress
     elapsed = time.time() - start_time
-    samples_per_sec = processed_count / elapsed if elapsed > 0 else 0
-    eta_seconds = (num_to_process - processed_count) / samples_per_sec if samples_per_sec > 0 else 0
-    eta_str = f"{int(eta_seconds // 3600)}h {int((eta_seconds % 3600) // 60)}m" if eta_seconds > 0 else "calculating..."
+    speed = processed_count / elapsed if elapsed > 0 else 0
+    remaining = num_to_process - processed_count
+    eta_seconds = remaining / speed if speed > 0 else 0
+    eta_str = f'{int(eta_seconds // 3600)}h {int((eta_seconds % 3600) // 60)}m' if speed > 0 else 'calculating...'
     
-    logging.info(f'Batch {batch_count}: Processing samples {processed_count}-{processed_count + current_batch_size_samples}/{num_to_process} ({current_batch_size_crops} crops) | Speed: {samples_per_sec:.2f} samples/sec | ETA: {eta_str}')
+    logging.info(
+        f'Batch {batch_idx}: Processing samples {processed_count}-{processed_count + actual_batch_size}/{num_to_process} '\
+        f'({pass2_num_test_clips} crop) | Speed: {speed:.2f} samples/sec | '\
+        f'GPU Memory: {gpu_tracker.get_memory_used_mb():.0f} MB | ETA: {eta_str}'\
+    )
     
-    try:
-      inputs = batch['inputs']
+    # Process each sample in batch (single crop in Pass 2)
+    for sample_idx in range(actual_batch_size):
+      if processed_count >= num_to_process:
+        break
       
-      # Handle multicrop evaluation properly
-      # num_test_clips already retrieved above
-      num_actual_samples = current_batch_size_crops // num_test_clips
-      
-      if current_batch_size_crops % num_test_clips != 0:
-        logging.warning(f'Batch size {current_batch_size_crops} not divisible by num_test_clips {num_test_clips}. Setting num_test_clips=1.')
-        num_test_clips = 1
-        num_actual_samples = current_batch_size_crops
-      
-      # Get labels for actual samples (not crops)
-      batch_labels = []
-      for i in range(num_actual_samples):
+      # Get label for this sample from dataset batch
+      if batch_labels is not None:
+        label = batch_labels[sample_idx]
+      else:
+        # Fallback to TFRecord streaming if dataset doesn't have labels
         try:
           label = next(label_iterator)
-          batch_labels.append(label)
         except StopIteration:
-          # Ran out of labels - shouldn't happen but handle gracefully
-          logging.warning(f'Label iterator exhausted at sample {processed_count + i}. Using zero vector.')
-          batch_labels.append(np.zeros(num_classes, dtype=np.float32))
+          logging.warning(f'Label iterator exhausted at sample {processed_count}')
+          break
       
-      batch_labels = np.array(batch_labels)
+      # Extract this sample's crop (only 1 crop in Pass 2)
+      sample_inputs = {}
+      for modality_key in inputs_dict_seq:
+        if modality_key in ['label', 'batch_mask']:
+          continue
+        # Shape: [batch_size * 1, ...] -> extract single crop
+        start_idx = sample_idx * pass2_num_test_clips
+        end_idx = (sample_idx + 1) * pass2_num_test_clips
+        sample_inputs[modality_key] = inputs_dict_seq[modality_key][start_idx:end_idx]
       
-      # Extract activations for ALL crops in the batch
-      result = extract_with_intermediates(model_instance, params, model_state, inputs)
+      # Process sample (single crop in Pass 2, so just 1 forward pass)
+      result = process_sample_with_multicrop(
+          params, model_state, sample_inputs, 
+          model_instance.flax_model, pass2_num_test_clips, multicrop_clips_per_device
+      )
       
-      # Average logits across crops for each sample
-      if num_test_clips > 1:
-        # Reshape logits from [batch*clips, classes] to [batch, clips, classes]
-        logits_all_crops = result['logits'].reshape(num_actual_samples, num_test_clips, -1)
-        # Average across crops (axis=1)
-        averaged_logits = np.mean(logits_all_crops, axis=1)
-        logging.info(f'  Averaged {num_test_clips} crops per sample: {logits_all_crops.shape} -> {averaged_logits.shape}')
-      else:
-        averaged_logits = result['logits']
+      # Filter activations to essential (MLP outputs only)
+      essential = filter_essential_activations(result['activations'])
       
-      # Store averaged logits
-      if logits_accumulator is not None:
-        logits_accumulator.add_sample(averaged_logits, batch_labels)
-      
-      # Filter to essential activations (convert JAX arrays to numpy immediately)
-      essential_jax = filter_essential_activations(result['activations'])
-      
-      # Convert JAX DeviceArrays to numpy arrays to free device memory
-      essential = {}
-      for key, value in essential_jax.items():
-        essential[key] = np.array(value)  # Force copy to host memory
-      del essential_jax
-      
-      # Immediately delete the full activations dict to free memory
-      del result
-      
-      # Log first batch info BEFORE deleting
-      if batch_idx == 0:
-        if essential:
-          logging.info('\nFirst batch activations:')
-          for name, value in essential.items():
-            logging.info(f'  {name}: shape {value.shape}, size {value.nbytes / 1024**2:.1f} MB')
+      # Log first sample info
+      if processed_count == 0:
+        logging.info('\nFirst batch activations:')
+        for name, value in essential.items():
+          logging.info(f'  {name}: shape {value.shape}, size {value.nbytes / 1024**2:.1f} MB')
         
         logging.info('\nFirst batch label info:')
-        logging.info(f'  Labels shape: {batch_labels.shape}')
-        logging.info(f'  Labels dtype: {batch_labels.dtype}')
-        logging.info(f'  First sample - sum: {batch_labels[0].sum()}, active: {np.where(batch_labels[0] > 0)[0]}')
+        logging.info(f'  Labels shape: {label.shape}')
+        logging.info(f'  Labels dtype: {label.dtype}')
+        logging.info(f'  First sample - sum: {label.sum()}, active: {np.where(label > 0)[0]}')
         
-        active_classes = np.where(batch_labels[0] > 0)[0]
+        active_classes = np.where(label > 0)[0]
         logging.info(f'\nFirst sample has {len(active_classes)} active classes:')
         for class_idx in active_classes[:5]:
           logging.info(f'  - {index_to_name[class_idx]}')
       
-      # Add batch to accumulator only if activations are being saved
+      # Add to accumulator (handles multi-label correctly)
       if FLAGS.save_activations and essential:
-        accumulator.add_sample(essential, batch_labels)
+        accumulator.add_sample(essential, label)
+        del essential  # Free CPU memory immediately
       
-      # Delete ALL batch data immediately after processing to free RAM
-      del batch_labels
-      del essential
-      del inputs
-      del batch  # Delete the entire batch dict including inputs
+      # Clean up
+      del result, sample_inputs, label
       
-      # Force immediate garbage collection after deleting batch data
-      import gc
-      gc.collect()
-      
-      # Increment by actual samples (not crops)
-      processed_count += num_actual_samples
-      batch_count += 1
-      
-      batch_time = time.time() - batch_start_time
-      logging.info(f'  → Batch completed in {batch_time:.1f}s ({num_actual_samples / batch_time:.2f} samples/sec)')
-      
-      # Clear JAX cache and run garbage collection MORE aggressively
-      if batch_count % FLAGS.clear_cache_every == 0:
-        jax.clear_caches()
-        import gc
-        gc.collect()
-        # Force Python to release memory back to OS
-        try:
-          import ctypes
-          libc = ctypes.CDLL("libc.so.6")
-          libc.malloc_trim(0)
-        except Exception:
-          pass  # malloc_trim not available on all systems
-      
-      # Save checkpoint periodically
-      if FLAGS.checkpoint_every > 0 and batch_count % FLAGS.checkpoint_every == 0 and batch_count > 0:
-        save_checkpoint(accumulator, processed_count, FLAGS.output_dir)
-        # Aggressively clean up memory after checkpoint
-        import gc
-        gc.collect()
-        gc.collect()  # Run twice to clean up cyclic references
-        # Force return memory to OS
-        try:
-          import ctypes
-          libc = ctypes.CDLL("libc.so.6")
-          libc.malloc_trim(0)
-        except Exception:
-          pass
+      processed_count += 1
     
-    except Exception as e:
-      logging.error(f'ERROR processing batch {batch_idx}: {e}')
-      import traceback
-      logging.error(traceback.format_exc())
-      
-      # Save emergency checkpoint on error
-      if FLAGS.checkpoint_every > 0:
-        logging.info('Saving emergency checkpoint before continuing...')
-        save_checkpoint(accumulator, processed_count, FLAGS.output_dir, 'checkpoint_emergency.pkl')
-      
-      # Increment by actual samples that would have been processed (to avoid reprocessing on resume)
-      num_test_clips = config.dataset_configs.get('num_test_clips', 1)
-      num_actual_samples_skipped = current_batch_size_crops // num_test_clips
-      logging.warning(f'Skipping {num_actual_samples_skipped} samples from failed batch (batch had {current_batch_size_crops} crops)')
-      processed_count += num_actual_samples_skipped
-      continue
+    # Batch completed
+    batch_duration = time.time() - batch_start_time
+    logging.info(f'  → Batch completed in {batch_duration:.1f}s ({actual_batch_size / batch_duration:.2f} samples/sec)')
+    
+    # Save checkpoint if requested
+    if FLAGS.checkpoint_every > 0 and batch_idx % FLAGS.checkpoint_every == 0:
+      save_checkpoint(accumulator, processed_count, FLAGS.output_dir)
+    
+    batch_count += 1
 
   # Get stats WITHOUT loading all averages into memory
   stats = accumulator.get_stats()
@@ -1047,7 +1382,7 @@ def main(argv):
   # NOTE: We don't load all data into memory at once because ~88GB >> 62GB RAM
   total_size = 0  # Initialize for later reporting
   if FLAGS.save_activations and accumulator.activation_names:
-    logging.info('\nSaving class-averaged activations (streaming to avoid OOM)...')
+
     
     # Instead of using np.savez_compressed with a dict (which loads everything),
     # we'll write incrementally using a context manager approach
@@ -1166,6 +1501,35 @@ def main(argv):
   
   if FLAGS.compute_map and map_score is not None:
     logging.info(f'Model mAP: {map_score:.4f}')
+  
+  # Print GPU memory statistics
+  gpu_stats = gpu_tracker.get_stats()
+  if gpu_stats:
+    logging.info('\n' + '='*80)
+    logging.info('GPU MEMORY STATISTICS:')
+    logging.info(f'  Peak GPU Memory: {gpu_stats["peak_memory_mb"]:.0f} MB')
+    logging.info(f'  Average GPU Memory: {gpu_stats["avg_memory_mb"]:.0f} MB')
+    logging.info(f'  Total GPU Memory Available: {gpu_stats["total_gpu_memory_mb"]:.0f} MB')
+    logging.info(f'  Number of GPUs: {gpu_stats["num_gpus"]}')
+    
+    if gpu_tracker.num_oom_errors > 0:
+      logging.warning(f'\n  ⚠️  OOM ERRORS DETECTED: {gpu_tracker.num_oom_errors} OOM failure(s)')
+      logging.warning(f'  Failed batch size: {gpu_tracker.oom_batch_size}')
+      logging.warning(f'  RECOMMENDATION: Reduce BATCH_SIZE to 1 and retry, or split dataset into smaller parts')
+    
+    # Estimate safe batch size for next run
+    if processed_count > 0 and gpu_stats['peak_memory_mb'] > 0:
+      mem_per_sample = gpu_stats['peak_memory_mb'] / processed_count
+      estimated_batch_size, note = gpu_tracker.estimate_max_batch_size(mem_per_sample, FLAGS.batch_size, safety_margin=0.15)
+      logging.info(f'\n  Memory per sample: {mem_per_sample:.1f} MB')
+      logging.info(f'  Estimated safe batch size for next run: {estimated_batch_size}')
+      logging.info(f'  Current batch size: {FLAGS.batch_size}')
+      if note:
+        logging.warning(f'  → {note}')
+      elif estimated_batch_size > FLAGS.batch_size:
+        logging.info(f'  → You can increase BATCH_SIZE to {estimated_batch_size} to improve speed')
+      elif estimated_batch_size < FLAGS.batch_size:
+        logging.warning(f'  → BATCH_SIZE {FLAGS.batch_size} is too high! Reduce to {estimated_batch_size}')
   
   logging.info('='*80)
   

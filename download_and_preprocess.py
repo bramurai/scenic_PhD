@@ -340,8 +340,8 @@ def process_video_entry(row: dict, temp_dir: str, label_to_index: Optional[dict]
                 logging.info(f"Found video in temp_downloads/ for {clip_id}: {temp_downloads_candidate}")
                 temp_video = temp_downloads_candidate
                 need_to_download = False
-                # Assume temp_downloads contains full videos
-                extraction_start = csv_start_time
+                # temp_downloads contains pre-clipped segments, extract from 0
+                extraction_start = 0
 
         # If not in temp_dir or temp_downloads/, check local_videos_dir
         if need_to_download and FLAGS.local_videos_dir:
