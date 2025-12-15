@@ -170,7 +170,7 @@ def get_config():
   config.init_from.model_config = None
  
   # Point to your trained checkpoint for inference
-  config.init_from.checkpoint_path = '/project/3026018.01/Models/MBT/CheckPoints/MBT_AV'  # Path to VIT model checkpoint
+  config.init_from.checkpoint_path = '/project/3026018.01/Models/MBT/CheckPoints/MINI_AV'  # Path to VIT model checkpoint
   config.init_from.checkpoint_format = 'scenic'
   config.init_from.model_config = ml_collections.ConfigDict()
   config.init_from.model_config.model = ml_collections.ConfigDict()

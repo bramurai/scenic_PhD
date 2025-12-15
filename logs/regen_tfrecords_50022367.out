@@ -1,0 +1,23 @@
+----------------------------------------
+Start task prologue Mon Dec 15 19:52:12 CET 2025
+----------------------------------------
+Step ID:         50022367.
+Username:        bravhee
+Group:           mpla
+Asked resources: walltime=4:00:00,nodes=1,cpus=32,mem=128G
+Queue:           batch
+Compute nodes:   dccn-c079
+----------------------------------------
+End task prologue Mon Dec 15 19:52:12 CET 2025
+----------------------------------------
+=========================================
+Regenerating TFRecords from temp_downloads/
+=========================================
+Start time: Mon Dec 15 19:52:12 CET 2025
+
+Deleting old TFRecords...
+Old TFRecords deleted.
+
+Regenerating AudioSet eval TFRecords...
+Logs will update every 10 videos processed...
+

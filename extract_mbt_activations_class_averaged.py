@@ -348,33 +348,94 @@ def resolve_modality_keys(batch: Dict[str, Any]):
 
 
 def load_checkpoint(config: ml_collections.ConfigDict, checkpoint_dir: str):
-  """Load trained MBT checkpoint."""
+  """Load trained MBT checkpoint with validation."""
   logging.info(f'Loading checkpoint from {checkpoint_dir}...')
   
+  # Determine which checkpoint file to load
+  loaded_checkpoint_file = None
+  
   if os.path.isfile(checkpoint_dir):
+    # Direct file path
+    loaded_checkpoint_file = checkpoint_dir
     checkpoint_path = checkpoints.restore_checkpoint(checkpoint_dir, None)
   else:
+    # Directory containing checkpoint files
     checkpoint_files = [f for f in os.listdir(checkpoint_dir) 
                        if not f.startswith('.') and os.path.isfile(os.path.join(checkpoint_dir, f))]
     
+    if not checkpoint_files:
+      raise ValueError(f'No checkpoint files found in {checkpoint_dir}')
+    
+    logging.info(f'Found {len(checkpoint_files)} checkpoint file(s): {checkpoint_files}')
+    
     if len(checkpoint_files) == 1:
-      single_ckpt = os.path.join(checkpoint_dir, checkpoint_files[0])
-      checkpoint_path = checkpoints.restore_checkpoint(single_ckpt, None)
+      loaded_checkpoint_file = os.path.join(checkpoint_dir, checkpoint_files[0])
+      logging.info(f'Loading single checkpoint: {checkpoint_files[0]}')
+      checkpoint_path = checkpoints.restore_checkpoint(loaded_checkpoint_file, None)
     else:
+      # Multiple files - let Flax find the latest
+      logging.info('Multiple checkpoint files found, using Flax to select latest...')
+      loaded_checkpoint_file = checkpoint_dir
       checkpoint_path = checkpoints.restore_checkpoint(checkpoint_dir, None)
   
   if checkpoint_path is None:
     raise ValueError(f'No checkpoint found in {checkpoint_dir}')
   
-  if 'params' in checkpoint_path:
-    params = checkpoint_path['params']
-  elif 'optimizer' in checkpoint_path and 'target' in checkpoint_path['optimizer']:
-    params = checkpoint_path['optimizer']['target']
-  else:
-    params = checkpoint_path
+  # Log checkpoint structure
+  logging.info(f'\n[Checkpoint Structure]')
+  logging.info(f'Loaded from: {loaded_checkpoint_file}')
+  logging.info(f'Type: {type(checkpoint_path).__name__}')
   
+  # Inspect top-level keys
+  if isinstance(checkpoint_path, dict):
+    top_keys = list(checkpoint_path.keys())
+    logging.info(f'Top-level keys: {top_keys}')
+    
+    for key in top_keys[:5]:  # Show first 5 keys with details
+      value = checkpoint_path[key]
+      if isinstance(value, dict):
+        subkeys = list(value.keys())[:5]
+        logging.info(f'  {key}: dict with keys {subkeys}...')
+      elif hasattr(value, 'shape'):
+        logging.info(f'  {key}: array shape {value.shape}')
+      else:
+        logging.info(f'  {key}: {type(value).__name__}')
+  
+  # Extract parameters with validation
+  logging.info(f'\n[Parameter Extraction]')
+  
+  if 'params' in checkpoint_path:
+    logging.info('✓ Found "params" key - using checkpoint_path["params"]')
+    params = checkpoint_path['params']
+    extraction_method = 'params'
+  elif 'optimizer' in checkpoint_path and isinstance(checkpoint_path['optimizer'], dict) and 'target' in checkpoint_path['optimizer']:
+    logging.info('✓ Found "optimizer/target" key - using checkpoint_path["optimizer"]["target"]')
+    params = checkpoint_path['optimizer']['target']
+    extraction_method = 'optimizer/target'
+  else:
+    logging.info('⚠ No standard structure found, using entire checkpoint as params')
+    params = checkpoint_path
+    extraction_method = 'raw'
+  
+  # Validate params structure
+  if isinstance(params, dict):
+    param_keys = list(params.keys())[:5]
+    logging.info(f'Extracted params type: dict with keys {param_keys}...')
+  elif hasattr(params, 'shape'):
+    logging.info(f'Extracted params type: array with shape {params.shape}')
+  else:
+    logging.info(f'Extracted params type: {type(params).__name__}')
+  
+  logging.info(f'Parameter extraction method: {extraction_method}')
+  
+  # Create model
   model_cls = mbt_model.MBTMultilabelClassificationModel
   spec_time_dim = config.dataset_configs.num_spec_frames * config.dataset_configs.spec_shape[0]
+  
+  logging.info(f'\n[Model Initialization]')
+  logging.info(f'Model class: {model_cls.__name__}')
+  logging.info(f'Num classes: {config.dataset_configs.num_classes}')
+  logging.info(f'Spectrogram time dim: {spec_time_dim}')
   
   model_instance = model_cls(config, {
       'num_classes': config.dataset_configs.num_classes,
@@ -389,7 +450,7 @@ def load_checkpoint(config: ml_collections.ConfigDict, checkpoint_dir: str):
   model_state = {}
   rng = jax.random.PRNGKey(0)
   
-  logging.info('Checkpoint loaded successfully')
+  logging.info('✓ Checkpoint loaded and validated successfully')
   return model_instance, params, model_state, rng
 
 

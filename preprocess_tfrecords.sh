@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=regen_tfrecords
-#SBATCH --output=regen_tfrecords_%j.out
-#SBATCH --error=regen_tfrecords_%j.err
+#SBATCH --output=logs/regen_tfrecords_%j.out
+#SBATCH --error=logs/regen_tfrecords_%j.err
 #SBATCH --time=4:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
@@ -34,7 +34,8 @@ export OPENBLAS_NUM_THREADS=32
 # Delete old TFRecords to regenerate from scratch
 echo "Deleting old TFRecords..."
 rm -rf Datasets/audioset_eval/data-*.tfrecord
-echo "Old TFRecords deleted."
+rm -rf Datasets/audioset_eval/.progress.json
+echo "Old TFRecords and progress file deleted."
 echo ""
 
 # Regenerate eval set (using existing videos in temp_downloads/)
@@ -49,13 +50,16 @@ python3 -u download_and_preprocess.py \
     --num_shards=10 \
     --audioset_labels_csv=Video_csvs/audioset_labels.csv \
     --local_videos_dir=downloaded_videos \
-    --require_local=False \
+    --require_local=True \
     --local_are_clips=True \
     --download_full_segment=True \
     --save_progress_every=10 \
     --target_fps=25 \
     --audio_sample_rate=16000 \
-    --n_mels=128 
+    --n_mels=128 \
+    --win_length_ms=25.0 \
+    --hop_length_ms=10.0 \
+    --decode_audio=True 
 
 echo ""
 echo "========================================="

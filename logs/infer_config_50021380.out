@@ -1,0 +1,110 @@
+----------------------------------------
+Start task prologue Mon Dec 15 19:09:58 CET 2025
+----------------------------------------
+Step ID:         50021380.
+Username:        bravhee
+Group:           mpla
+Asked resources: walltime=5:00,nodes=1,cpus=4,mem=32G
+Queue:           batch
+Compute nodes:   dccn-c055
+----------------------------------------
+End task prologue Mon Dec 15 19:09:58 CET 2025
+----------------------------------------
+
+======================================================================
+Inferring training config for: MBT_AV
+======================================================================
+  Attention: query kernel shape = (768, 12, 64)
+  → num_heads = 12, head_dim = 64
+  MLP: Dense_0 kernel shape = (768, 3072)
+  → mlp_dim = 3072
+  Output projection kernel shape = (768, 527)
+  → num_classes = 527
+
+  Checking for normalization stats...
+  ✓ model_state is empty (no batch_stats)
+
+======================================================================
+INFERRED CONFIG for MBT_AV:
+======================================================================
+  config.model.classifier = token
+  config.model.dropout_rate = unknown (0.0 for inference, but what was training?)
+  config.model.fusion_layer = unknown (likely 6 or 8)
+  config.model.has_batch_stats = False
+  config.model.hidden_size = 768
+  config.model.mlp_dim = 3072
+  config.model.modality_fusion = ('rgb', 'spectrogram')
+  config.model.n_bottlenecks = 4
+  config.model.num_classes = 527
+  config.model.num_heads = 12
+  config.model.num_layers = 12
+  config.model.output_bias_mean = -0.7810368537902832
+  config.model.output_bias_std = 0.128278449177742
+  config.model.patches.size = [16, 16, 2]
+  config.model.representation_size = None
+  config.model.temporal_encoding_method = unknown (likely 3d_conv)
+  config.model.test_with_bottlenecks = unknown (should match training)
+  config.model.use_bottleneck = True
+
+
+======================================================================
+Inferring training config for: MINI_AV
+======================================================================
+  Attention: query kernel shape = (768, 12, 64)
+  → num_heads = 12, head_dim = 64
+  MLP: Dense_0 kernel shape = (768, 3072)
+  → mlp_dim = 3072
+  Output projection kernel shape = (768, 527)
+  → num_classes = 527
+
+  Checking for normalization stats...
+  ✓ model_state is empty (no batch_stats)
+
+======================================================================
+INFERRED CONFIG for MINI_AV:
+======================================================================
+  config.model.classifier = token
+  config.model.dropout_rate = unknown (0.0 for inference, but what was training?)
+  config.model.fusion_layer = unknown (likely 6 or 8)
+  config.model.has_batch_stats = False
+  config.model.hidden_size = 768
+  config.model.mlp_dim = 3072
+  config.model.modality_fusion = ('rgb', 'spectrogram')
+  config.model.n_bottlenecks = 4
+  config.model.num_classes = 527
+  config.model.num_heads = 12
+  config.model.num_layers = 12
+  config.model.output_bias_mean = -0.20199523866176605
+  config.model.output_bias_std = 0.007997024804353714
+  config.model.patches.size = [16, 16, 2]
+  config.model.representation_size = None
+  config.model.temporal_encoding_method = unknown (likely 3d_conv)
+  config.model.test_with_bottlenecks = unknown (should match training)
+  config.model.use_bottleneck = True
+
+======================================================================
+POTENTIAL MISMATCHES:
+These settings can't be determined from checkpoint but affect results:
+  1. fusion_layer (6 vs 8 makes a big difference!)
+  2. test_with_bottlenecks (True vs False)
+  3. temporal_encoding_config.method ('3d_conv' vs others)
+  4. Training hyperparameters (learning rate, augmentation, etc.)
+  5. Dataset preprocessing (spec_mean, spec_stddev, normalization)
+
+The checkpoints ARE trained with classifier='token', but performance
+could still be poor due to these other mismatches or undertraining.
+======================================================================
+----------------------------------------
+Start job epilogue Mon Dec 15 19:10:10 CET 2025
+----------------------------------------
+Job ID:          50021380
+Job Exit Code:   0:0
+Username:        bravhee
+Group:           mpla
+Queue:           batch
+Compute nodes:   dccn-c055
+Asked resources: walltime=5:00,nodes=1,cpus=4,mem=32G
+Used resources:  cputime=00:00:48,walltime=00:00:12,memory=0
+----------------------------------------
+End job epilogue Mon Dec 15 19:10:10 CET 2025
+----------------------------------------

@@ -17,7 +17,7 @@
 #SBATCH --ntasks=1                         # Number of tasks
 #SBATCH --cpus-per-task=16                 # CPUs per task (4 per GPU)
 #SBATCH --gres=gpu:4                       # 4 GPUs to handle 4-crop multicrop evaluation
-#SBATCH --mem=256G                         # Total memory (32GB per GPU)
+#SBATCH --mem=180G                         # Total memory (32GB per GPU)
 #SBATCH --time=24:00:00                    # Wall time (24 hours)
 #SBATCH --output=logs/mbt_extraction_%j.log     # Output log file (%j = job ID)
 #SBATCH --error=logs/mbt_extraction_%j.err      # Error log file
@@ -38,12 +38,9 @@ set -e  # Exit on error
 SCRIPT_DIR="${SLURM_SUBMIT_DIR:-.}"
 cd "$SCRIPT_DIR"
 
-# Optional: Clean old extraction logs before running (keeps only the 5 most recent)
-echo "Cleaning old extraction logs (keeping 5 most recent)..."
+# Create logs directory first (before trying to clean old logs)
 
-cd "$SCRIPT_DIR/logs" && \
-    ls -t mbt_extraction_*.log mbt_extraction_*.err 2>/dev/null | tail -n +6 | xargs rm -f 2>/dev/null
-cd "$SCRIPT_DIR"
+
 echo ""
 
 # Python environment (choose one):
@@ -55,20 +52,20 @@ echo ""
 # MBT Script
 MBT_SCRIPT="${SCRIPT_DIR}/extract_mbt_activations_class_averaged.py"
 
-# Config file
-CONFIG="${SCRIPT_DIR}/scenic/projects/mbt/configs/audioset/Inference_config.py"
+# Config file - MINI_AV checkpoint
+CONFIG="${SCRIPT_DIR}/scenic/projects/mbt/configs/audioset/Inference_mini.py"
 
-# Checkpoint directory
-CHECKPOINT_DIR="${SCRIPT_DIR}/CheckPoints/MBT_AV"
+# Checkpoint directory - MINI_AV
+CHECKPOINT_DIR="${SCRIPT_DIR}/CheckPoints/MINI_AV"
 
 # Test data directory
-TEST_DATA_DIR="${SCRIPT_DIR}/Datasets/audioset_eval_configCorrect"
+TEST_DATA_DIR="${SCRIPT_DIR}/Datasets/audioset_eval"
 
 # Labels CSV
 LABELS_CSV="${SCRIPT_DIR}/Video_csvs/audioset_labels.csv"
 
 # Output directory
-OUTPUT_DIR="${SCRIPT_DIR}/a_e$(date +%Y-%m-%d_%H%M%S)"
+OUTPUT_DIR="${SCRIPT_DIR}/extract_test_$(date +%Y-%m-%d_%H%M%S)"
 
 # Processing parameters
 NUM_SAMPLES=80     # None = process all, or specify number (e.g., 500)
@@ -97,9 +94,6 @@ echo "Job ID: $SLURM_JOB_ID"
 echo "Started at: $(date)"
 echo ""
 
-# Create logs directory if it doesn't exist
-mkdir -p "$SCRIPT_DIR/logs"
-
 # Print environment info
 echo "Environment Information:"
 echo "  Node: $(hostname)"
@@ -116,7 +110,8 @@ echo "  Config: $CONFIG"
 echo "  Checkpoint: $CHECKPOINT_DIR"
 echo "  Test data: $TEST_DATA_DIR"
 echo "  Output: $OUTPUT_DIR"
-echo "  Batch size: $BATCH_SIZE"
+echo "  Pass 1 Batch size: $PASS1_BATCH_SIZE"
+echo "  Pass 2 Batch size: $PASS2_BATCH_SIZE"
 echo "  Num samples: $NUM_SAMPLES"
 echo ""
 
@@ -149,7 +144,7 @@ echo "  Set GPU/cuDNN workaround environment variables"
 
 module load anaconda3
 
-source activate "scenic_phd"
+source activate scenic_phd
 
 # Verify Python
 PYTHON=$(which python3)

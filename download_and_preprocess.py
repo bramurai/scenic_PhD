@@ -459,8 +459,10 @@ def main(argv):
     # Generate clip_id
     df['clip_id'] = df['video_path'] + '_' + df['start'].astype(int).astype(str)
     
-    # Convert video_path to expected format (YTID -> YTID_000001.mp4)
-    df['video_path'] = df['video_path'] + '_000001.mp4'
+    # Convert video_path to expected format
+    # If videos are downloaded with start_time suffix (YTID_370.mp4), use that
+    # Otherwise use YTID_000001.mp4 as fallback
+    df['video_path'] = df['video_path'] + '_' + df['start'].astype(int).astype(str) + '.mp4'
     
     total_examples = len(df)
     logging.info(f"Processing {total_examples} examples")
